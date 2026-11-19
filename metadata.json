@@ -1,0 +1,6 @@
+{
+  "name": "DylexiVision",
+  "description": "An AI-powered reading accessibility studio with live speech highlighting, reading ruler, OCR scanning, multilingual reading, and customizable typography.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
