@@ -162,20 +162,24 @@ let primaryCooldownUntil = 0;
 
 async function callGeminiWithFallback<T>(
   operation: (model: string, thinkingLevel: ThinkingLevel) => Promise<T>,
-  timeoutMs = 15000,
+  timeoutMs = 20000,
 ): Promise<{ result: T; modelUsed: string }> {
   const inCooldown = Date.now() < primaryCooldownUntil;
-  const primaryTimeout = Math.min(timeoutMs, 10000);
-  const attempts: Array<{ model: string; thinkingLevel: ThinkingLevel; ms: number }> = inCooldown
-    ? [{ model: FALLBACK_MODEL_NAME, thinkingLevel: ThinkingLevel.MINIMAL, ms: timeoutMs }]
+  const primaryTimeout = Math.min(timeoutMs, 11000);
+  const attempts: Array<{ model: string; thinkingLevel: ThinkingLevel; ms: number; backoffMs: number }> = inCooldown
+    ? [
+        { model: FALLBACK_MODEL_NAME, thinkingLevel: ThinkingLevel.MINIMAL, ms: timeoutMs, backoffMs: 700 },
+        { model: FALLBACK_MODEL_NAME, thinkingLevel: ThinkingLevel.MINIMAL, ms: timeoutMs, backoffMs: 0 },
+      ]
     : [
-        { model: MODEL_NAME, thinkingLevel: ThinkingLevel.LOW, ms: primaryTimeout },
-        { model: FALLBACK_MODEL_NAME, thinkingLevel: ThinkingLevel.MINIMAL, ms: timeoutMs },
+        { model: MODEL_NAME, thinkingLevel: ThinkingLevel.LOW, ms: primaryTimeout, backoffMs: 250 },
+        { model: FALLBACK_MODEL_NAME, thinkingLevel: ThinkingLevel.MINIMAL, ms: timeoutMs, backoffMs: 700 },
+        { model: FALLBACK_MODEL_NAME, thinkingLevel: ThinkingLevel.MINIMAL, ms: timeoutMs, backoffMs: 0 },
       ];
 
   let lastError: unknown;
   for (let i = 0; i < attempts.length; i += 1) {
-    const { model, thinkingLevel, ms } = attempts[i];
+    const { model, thinkingLevel, ms, backoffMs } = attempts[i];
     try {
       const result = await withTimeout(operation(model, thinkingLevel), ms);
       return { result, modelUsed: model };
@@ -189,7 +193,9 @@ async function callGeminiWithFallback<T>(
       if (model === MODEL_NAME) {
         primaryCooldownUntil = Date.now() + 60_000;
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (backoffMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
     }
   }
   throw lastError;
@@ -202,7 +208,11 @@ function parseGeminiJson<T>(raw: string | undefined, fallback: T): T {
     .replace(/\s*```$/i, '')
     .trim();
   if (!cleaned) return fallback;
-  return JSON.parse(cleaned) as T;
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 function splitForTranslation(text: string, maxChars = 420): string[] {
@@ -217,7 +227,9 @@ function splitForTranslation(text: string, maxChars = 420): string[] {
       continue;
     }
 
-    const sentences = trimmed.match(/[^.!?]+[.!?]*\s*/g) ?? [trimmed];
+    const sentences =
+      trimmed.match(/(?:[^.!?]|[.!?](?!["'”’)\]]*(?:\s|$)))+(?:[.!?]+["'”’)\]]*)?\s*/g) ??
+      [trimmed];
     let current = '';
     for (const sentence of sentences) {
       if ((current + sentence).length <= maxChars) {
@@ -339,30 +351,32 @@ async function startServer() {
           ? `இந்த தமிழ் உரைப்பகுதியின் அடிப்படையில் வாசிப்பு புரிதலை சோதிக்கும் 4 எளிய கேள்விகள், குறுகிய பதில்கள் மற்றும் குறிப்புகளை (hints) எளிய தமிழில் உருவாக்கவும்:\n\n${safeText}`
           : `Create 4 dyslexia-friendly reading comprehension questions based strictly on this passage:\n\n${safeText}`;
 
-        const { result: response, modelUsed } = await callGeminiWithFallback((model, thinkingLevel) =>
-          ai.models.generateContent({
-            model,
-            contents: prompt,
-            config: {
-              thinkingConfig: { thinkingLevel },
-              systemInstruction: isTamilPassage
-                ? 'நீங்கள் ஒரு தமிழ் வாசிப்பு உதவியாளர். கொடுக்கப்பட்ட தமிழ் உரைக்கு மட்டுமே ஏற்ப எளிய தமிழில் குறுகிய கேள்விகள், துல்லியமான பதில்கள் மற்றும் குறிப்புகளை வழங்கவும். தமிழ் எழுத்துக்களைச் சிதைக்காதீர்கள்.'
-                : 'You are a supportive reading tutor. Write clear, short, accessible questions with concise answers grounded strictly in the provided text.',
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: { type: Type.STRING },
-                    answer: { type: Type.STRING },
-                    hint: { type: Type.STRING },
+        const { result: response, modelUsed } = await callGeminiWithFallback(
+          (model, thinkingLevel) =>
+            ai.models.generateContent({
+              model,
+              contents: prompt,
+              config: {
+                thinkingConfig: { thinkingLevel },
+                systemInstruction: isTamilPassage
+                  ? 'நீங்கள் ஒரு தமிழ் வாசிப்பு உதவியாளர். கொடுக்கப்பட்ட தமிழ் உரைக்கு மட்டுமே ஏற்ப எளிய தமிழில் குறுகிய கேள்விகள், துல்லியமான பதில்கள் மற்றும் குறிப்புகளை வழங்கவும். தமிழ் எழுத்துக்களைச் சிதைக்காதீர்கள்.'
+                  : 'You are a supportive reading tutor. Write clear, short, accessible questions with concise answers grounded strictly in the provided text.',
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      question: { type: Type.STRING },
+                      answer: { type: Type.STRING },
+                      hint: { type: Type.STRING },
+                    },
+                    required: ['question', 'answer', 'hint'],
                   },
-                  required: ['question', 'answer', 'hint'],
                 },
               },
-            },
-          }),
+            }),
+          22000,
         );
         const parsed = parseGeminiJson<
           Array<{ question: string; answer: string; hint: string }>
@@ -890,7 +904,7 @@ Rules:
                 thinkingConfig: { thinkingLevel },
               },
             }),
-          6000,
+          9000,
         );
         const translatedText = (response.text ?? '').trim();
         if (translatedText) {

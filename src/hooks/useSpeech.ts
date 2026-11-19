@@ -122,7 +122,10 @@ export function useSpeech(): SpeechController {
   const supported =
     typeof window !== 'undefined' && 'speechSynthesis' in window;
 
-  const [rate, setRateState] = useState(() => loadNumber(RATE_KEY, 1));
+  const [rate, setRateState] = useState(() => {
+    const loaded = loadNumber(RATE_KEY, 1);
+    return Math.min(2, Math.max(0.5, loaded));
+  });
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voiceName, setVoiceNameState] = useState(() => {
     try {
@@ -594,10 +597,11 @@ export function useSpeech(): SpeechController {
 
   const setRate = useCallback(
     (r: number) => {
-      setRateState(r);
-      rateRef.current = r;
+      const clamped = Number.isFinite(r) ? Math.min(2, Math.max(0.5, r)) : 1;
+      setRateState(clamped);
+      rateRef.current = clamped;
       try {
-        localStorage.setItem(RATE_KEY, String(r));
+        localStorage.setItem(RATE_KEY, String(clamped));
       } catch {
         // ignore
       }

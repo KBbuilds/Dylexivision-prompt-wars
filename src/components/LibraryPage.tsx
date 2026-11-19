@@ -218,6 +218,16 @@ export function LibraryPage({
                             type="text"
                             value={draftTitle}
                             onChange={(e) => setDraftTitle(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                onRenameItem(item.id, draftTitle);
+                                setEditingId(null);
+                              } else if (e.key === 'Escape') {
+                                e.preventDefault();
+                                setEditingId(null);
+                              }
+                            }}
                             aria-label="Rename passage"
                             className={`flex-1 rounded-lg border px-2.5 py-1.5 text-sm ${tokens.input}`}
                             autoFocus

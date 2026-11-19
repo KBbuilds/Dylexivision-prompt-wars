@@ -10,19 +10,18 @@ import {
   AlertTriangle,
   ArrowRight,
   BookmarkCheck,
-  Camera,
   CheckCircle2,
+  Eraser,
   FileImage,
+  FileText,
   Loader2,
   RotateCcw,
   Upload,
-  Video,
-  X,
 } from 'lucide-react';
 import type { ThemeStyleTokens } from '@/settings';
 
 interface ScanTextPageProps {
-  onSendToStudio: (extractedText: string, source?: 'ocr') => void;
+  onSendToStudio: (extractedText: string, source?: 'ocr' | 'typed') => void;
   onSaveToLibrary: (extractedText: string, title?: string) => void;
   tokens: ThemeStyleTokens;
 }
@@ -175,6 +174,8 @@ export function ScanTextPage({
   onSaveToLibrary,
   tokens,
 }: ScanTextPageProps) {
+  const [inputMethod, setInputMethod] = useState<'image' | 'paste'>('image');
+  const [pastedText, setPastedText] = useState('');
   const [ocrLang, setOcrLang] = useState<OcrLanguageCode>('eng');
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | Blob | null>(null);
@@ -195,12 +196,8 @@ export function ScanTextPage({
     );
   const [savedFeedback, setSavedFeedback] = useState<string | null>(null);
 
-  // Optional live webcam capture
-  const [cameraActive, setCameraActive] = useState(false);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const scanRequestIdRef = useRef(0);
 
   useEffect(() => {
     setOfflineAssetStatus(
@@ -211,13 +208,35 @@ export function ScanTextPage({
   useEffect(() => {
     return () => {
       if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
     };
   }, [imagePreviewUrl]);
 
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+  const validateAndLoadImage = (file: File | Blob, sourceLabel: 'file' | 'drop' | 'paste') => {
+    if (!file.type.startsWith('image/')) {
+      setError(
+        sourceLabel === 'drop'
+          ? 'Please drop a valid image file (PNG, JPG, WebP, etc.).'
+          : 'Please select a valid image file (PNG, JPG, WebP, etc.).',
+      );
+      return false;
+    }
+    if (file.size === 0) {
+      setError('The selected image file is empty. Please choose another image.');
+      return false;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      setError('Image exceeds 20 MB. Please choose a smaller or cropped image.');
+      return false;
+    }
+    loadImageBlob(file);
+    return true;
+  };
+
   const loadImageBlob = (blob: File | Blob) => {
+    scanRequestIdRef.current += 1;
+    setScanning(false);
     setError(null);
     setUncertaintyWarning(null);
     setScanMeta(null);
@@ -232,15 +251,13 @@ export function ScanTextPage({
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setError('Please select a valid image file (PNG, JPG, WebP, etc.).');
-      return;
-    }
-    loadImageBlob(file);
+    validateAndLoadImage(file, 'file');
   };
 
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
+    if (inputMethod !== 'image') return;
     const items = e.clipboardData?.items;
     if (!items) return;
     for (const item of Array.from(items)) {
@@ -248,63 +265,28 @@ export function ScanTextPage({
         const blob = item.getAsFile();
         if (blob) {
           e.preventDefault();
-          loadImageBlob(blob);
+          validateAndLoadImage(blob, 'paste');
           break;
         }
       }
     }
   };
 
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    setCameraActive(false);
-  };
 
-  const startCamera = async () => {
-    setError(null);
-    if (!navigator.mediaDevices?.getUserMedia) {
-      cameraInputRef.current?.click();
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' } },
-      });
-      streamRef.current = stream;
-      setCameraActive(true);
-      requestAnimationFrame(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          void videoRef.current.play();
-        }
-      });
-    } catch {
-      cameraInputRef.current?.click();
-    }
-  };
-
-  const captureFromCamera = () => {
-    const video = videoRef.current;
-    if (!video) return;
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth || 1280;
-    canvas.height = video.videoHeight || 720;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    canvas.toBlob(
-      (blob) => {
-        if (blob) {
-          loadImageBlob(blob);
-          stopCamera();
-        }
-      },
-      'image/jpeg',
-      0.92,
-    );
+  const withStepTimeout = <T,>(
+    promise: Promise<T>,
+    ms: number,
+    message: string,
+  ): Promise<T> => {
+    let timer: number | undefined;
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]).finally(() => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    });
   };
 
   const getOrCreateTesseractWorker = async (
@@ -319,19 +301,23 @@ export function ScanTextPage({
     setOfflineAssetStatus('loading');
     const createPromise = (async () => {
       const { createWorker, OEM, PSM } = await import('tesseract.js');
-      const worker = await createWorker(lang, OEM.LSTM_ONLY, {
-        langPath: '/tessdata',
-        cacheMethod: 'write',
-        logger: (msg) => {
-          onLogger(
-            msg.status ?? '',
-            typeof msg.progress === 'number' ? msg.progress : undefined,
-          );
-        },
-        errorHandler: () => {
-          // Handled cleanly on rejection
-        },
-      });
+      const worker = await withStepTimeout(
+        createWorker(lang, OEM.LSTM_ONLY, {
+          langPath: '/tessdata',
+          cacheMethod: 'write',
+          logger: (msg) => {
+            onLogger(
+              msg.status ?? '',
+              typeof msg.progress === 'number' ? msg.progress : undefined,
+            );
+          },
+          errorHandler: () => {
+            // Handled cleanly on rejection
+          },
+        }),
+        40000,
+        `Timed out loading the local ${lang} OCR pack. Check your connection if not cached yet and retry.`,
+      );
       await worker.setParameters({
         tessedit_pageseg_mode: PSM.AUTO,
         preserve_interword_spaces: '1',
@@ -354,12 +340,14 @@ export function ScanTextPage({
 
   const runLocalTesseractFallback = async (
     blob: File | Blob,
+    requestId: number,
     reasonNotice?: string,
   ) => {
     const activeMeta =
       WORKING_OCR_LANGUAGES.find((l) => l.code === ocrLang) ??
       WORKING_OCR_LANGUAGES[0];
 
+    if (scanRequestIdRef.current !== requestId) return;
     setStatusLabel(
       loadedOfflinePacks.has(ocrLang)
         ? `Using cached local ${activeMeta.modelName} OCR engine…`
@@ -368,6 +356,7 @@ export function ScanTextPage({
     setProgress(null);
 
     const worker = await getOrCreateTesseractWorker(ocrLang, (msgStatus, p) => {
+      if (scanRequestIdRef.current !== requestId) return;
       if (msgStatus === 'recognizing text') {
         setStatusLabel(`Scanning printed ${activeMeta.label} text locally…`);
       } else if (msgStatus) {
@@ -378,14 +367,30 @@ export function ScanTextPage({
       }
     });
 
+    if (scanRequestIdRef.current !== requestId) return;
     const preparedImage = await prepareImageForTesseract(blob);
-    const result = await worker.recognize(preparedImage);
+
+    let result;
+    try {
+      result = await withStepTimeout(
+        worker.recognize(preparedImage),
+        45000,
+        'Local OCR recognition timed out. Try a smaller or cropped image.',
+      );
+    } catch (recErr) {
+      cachedTesseractWorkers.delete(ocrLang);
+      worker.terminate().catch(() => {});
+      throw recErr;
+    }
+
+    if (scanRequestIdRef.current !== requestId) return;
     const cleaned = cleanRecognizedText(result.data.text);
 
     if (!cleaned) {
       setError(
         `No readable printed ${activeMeta.label} text was found locally. Try a clearer image or ensure Vision AI is online for handwriting.`,
       );
+      setStatusLabel('');
       return;
     }
 
@@ -405,20 +410,49 @@ export function ScanTextPage({
   };
 
   const runOcr = async () => {
+    if (scanning) return;
     if (!selectedFile) {
-      setError('Upload, paste, or capture an image first.');
+      setError('Upload or paste an image first.');
       return;
     }
 
+    const requestId = ++scanRequestIdRef.current;
     setScanning(true);
     setError(null);
     setUncertaintyWarning(null);
     setScanMeta(null);
     setProgress(null);
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      try {
+        await runLocalTesseractFallback(
+          selectedFile,
+          requestId,
+          'Device appears offline; used local browser OCR instead.',
+        );
+      } catch (localErr) {
+        if (scanRequestIdRef.current === requestId) {
+          const detail =
+            localErr instanceof Error
+              ? localErr.message
+              : 'Could not extract text offline. Load the language pack while online once to cache it.';
+          setError(`Offline OCR failed: ${detail}`);
+          setStatusLabel('');
+        }
+      } finally {
+        if (scanRequestIdRef.current === requestId) {
+          setScanning(false);
+        }
+      }
+      return;
+    }
+
     setStatusLabel('Preparing image and reading printed or handwritten text…');
 
     try {
       const payload = await prepareImagePayloadForVision(selectedFile);
+      if (scanRequestIdRef.current !== requestId) return;
+
       const controller = new AbortController();
       const abortTimer = window.setTimeout(() => controller.abort(), 45000);
 
@@ -438,6 +472,8 @@ export function ScanTextPage({
         window.clearTimeout(abortTimer);
       }
 
+      if (scanRequestIdRef.current !== requestId) return;
+
       type VisionOcrResponse = {
         error?: string;
         message?: string;
@@ -455,6 +491,8 @@ export function ScanTextPage({
       } catch {
         data = null;
       }
+
+      if (scanRequestIdRef.current !== requestId) return;
 
       if (visionResponse.ok && data) {
         const cleaned = cleanRecognizedText(data.text ?? '');
@@ -487,30 +525,40 @@ export function ScanTextPage({
       const fallbackMsg =
         data?.message ||
         `Vision AI OCR is temporarily unavailable (HTTP ${visionResponse.status}).`;
-      await runLocalTesseractFallback(selectedFile, fallbackMsg);
+      await runLocalTesseractFallback(selectedFile, requestId, fallbackMsg);
     } catch (err) {
+      if (scanRequestIdRef.current !== requestId) return;
       // Network/timeout on Vision AI -> try cached local printed fallback
       try {
         await runLocalTesseractFallback(
           selectedFile,
+          requestId,
           err instanceof Error && err.name === 'AbortError'
             ? 'Vision AI request timed out; used local printed OCR instead.'
             : 'Could not reach Vision AI; used local printed OCR instead.',
         );
       } catch (localErr) {
-        const detail =
-          localErr instanceof Error
-            ? localErr.message
-            : 'Could not extract text from this image.';
-        setError(`OCR failed: ${detail}`);
+        if (scanRequestIdRef.current === requestId) {
+          const detail =
+            localErr instanceof Error
+              ? localErr.message
+              : 'Could not extract text from this image.';
+          setError(`OCR failed: ${detail}`);
+          setStatusLabel('');
+        }
       }
     } finally {
-      setScanning(false);
+      if (scanRequestIdRef.current === requestId) {
+        setScanning(false);
+      }
     }
   };
 
   const resetAll = () => {
+    scanRequestIdRef.current += 1;
+    setScanning(false);
     if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
+    if (fileInputRef.current) fileInputRef.current.value = '';
     setImagePreviewUrl(null);
     setSelectedFile(null);
     setExtractedText('');
@@ -520,7 +568,6 @@ export function ScanTextPage({
     setUncertaintyWarning(null);
     setScanMeta(null);
     setSavedFeedback(null);
-    stopCamera();
   };
 
   return (
@@ -534,9 +581,9 @@ export function ScanTextPage({
             Scan Text (Printed &amp; Handwritten OCR)
           </h1>
           <p className={`mt-1 text-sm sm:text-base ${tokens.subtext}`}>
-            Upload a photo, screenshot, or handwritten note, paste from
-            clipboard (Ctrl+V), or use your camera. Automatically detects
-            printed and handwritten English, Tamil, or mixed pages.
+            Upload a photo, screenshot, or scanned page, or paste from
+            clipboard (Ctrl+V). Automatically detects printed and handwritten
+            English, Tamil, or mixed pages.
           </p>
         </div>
 
@@ -614,10 +661,98 @@ export function ScanTextPage({
         </div>
       </div>
 
+      {/* Input method selector: Upload Image (OCR) vs Paste Text */}
+      <div
+        role="tablist"
+        aria-label="Choose text input method"
+        className={`inline-flex flex-wrap rounded-xl border p-1 ${tokens.panelBg} ${tokens.border}`}
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={inputMethod === 'image'}
+          onClick={() => setInputMethod('image')}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 min-h-[40px] text-sm font-semibold whitespace-nowrap transition-colors ${
+            inputMethod === 'image'
+              ? 'bg-teal-600 text-white'
+              : tokens.subtext
+          }`}
+        >
+          <Upload className="h-4 w-4" aria-hidden />
+          Upload Image
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={inputMethod === 'paste'}
+          onClick={() => setInputMethod('paste')}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 min-h-[40px] text-sm font-semibold whitespace-nowrap transition-colors ${
+            inputMethod === 'paste'
+              ? 'bg-teal-600 text-white'
+              : tokens.subtext
+          }`}
+        >
+          <FileText className="h-4 w-4" aria-hidden />
+          Paste Text
+        </button>
+      </div>
+
+      {inputMethod === 'paste' ? (
+        <section
+          aria-label="Paste text directly"
+          className={`rounded-3xl border p-5 sm:p-6 space-y-4 ${tokens.panelBg} ${tokens.border}`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className={`text-lg font-bold ${tokens.text}`}>
+                Paste Text
+              </h2>
+              <p className={`mt-0.5 text-xs sm:text-sm ${tokens.subtext}`}>
+                Paste text from your notes, PDFs or documents here.
+              </p>
+            </div>
+            {pastedText.trim() && (
+              <span className={`text-xs tabular-nums ${tokens.subtext}`}>
+                {pastedText.trim().split(/\s+/).length} words
+              </span>
+            )}
+          </div>
+
+          <textarea
+            value={pastedText}
+            onChange={(e) => setPastedText(e.target.value)}
+            placeholder="Paste or type English, தமிழ் (Tamil), or mixed-language text here…"
+            rows={10}
+            aria-label="Paste text directly for Reading Studio"
+            className={`w-full resize-y rounded-2xl border px-4 py-3.5 text-base leading-relaxed font-indic focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20 ${tokens.input}`}
+          />
+
+          <div className="flex flex-col sm:flex-row gap-3">
+            <button
+              type="button"
+              onClick={() => onSendToStudio(pastedText, 'typed')}
+              disabled={!pastedText.trim()}
+              className="flex-1 inline-flex items-center justify-center gap-2 rounded-2xl bg-teal-600 px-5 py-3.5 min-h-[48px] text-base font-bold text-white hover:bg-teal-500 disabled:opacity-45 disabled:cursor-not-allowed"
+            >
+              Send to Reading Studio
+              <ArrowRight className="h-5 w-5" aria-hidden />
+            </button>
+            <button
+              type="button"
+              onClick={() => setPastedText('')}
+              disabled={!pastedText}
+              className={`inline-flex items-center justify-center gap-2 rounded-2xl border px-4 py-3.5 min-h-[48px] text-sm font-semibold disabled:opacity-45 disabled:cursor-not-allowed whitespace-nowrap ${tokens.secondaryBtn}`}
+            >
+              <Eraser className="h-4 w-4" aria-hidden />
+              Clear
+            </button>
+          </div>
+        </section>
+      ) : (
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Left: Image input & preview */}
         <section
-          aria-label="Image upload and camera capture"
+          aria-label="Image upload"
           className={`rounded-3xl border p-5 sm:p-6 space-y-4 ${tokens.panelBg} ${tokens.border}`}
         >
           <div className="flex flex-wrap gap-2">
@@ -625,14 +760,6 @@ export function ScanTextPage({
               ref={fileInputRef}
               type="file"
               accept="image/*"
-              onChange={handleFileChange}
-              className="hidden"
-            />
-            <input
-              ref={cameraInputRef}
-              type="file"
-              accept="image/*"
-              capture="environment"
               onChange={handleFileChange}
               className="hidden"
             />
@@ -644,24 +771,6 @@ export function ScanTextPage({
             >
               <Upload className="h-4 w-4 text-teal-600" aria-hidden />
               Upload image
-            </button>
-
-            <button
-              type="button"
-              onClick={() => cameraInputRef.current?.click()}
-              className={`inline-flex items-center gap-2 rounded-xl border px-4 py-2.5 min-h-[44px] text-sm font-semibold ${tokens.secondaryBtn}`}
-            >
-              <Camera className="h-4 w-4 text-teal-600" aria-hidden />
-              Photo / Mobile Camera
-            </button>
-
-            <button
-              type="button"
-              onClick={cameraActive ? stopCamera : startCamera}
-              className={`inline-flex items-center gap-2 rounded-xl border px-4 py-2.5 min-h-[44px] text-sm font-semibold ${tokens.secondaryBtn}`}
-            >
-              <Video className="h-4 w-4 text-teal-600" aria-hidden />
-              {cameraActive ? 'Close webcam' : 'Live webcam'}
             </button>
 
             {(imagePreviewUrl || extractedText) && (
@@ -676,42 +785,14 @@ export function ScanTextPage({
             )}
           </div>
 
-          {cameraActive && (
-            <div className="space-y-3">
-              <div className="relative overflow-hidden rounded-2xl border border-teal-500 bg-black">
-                <video
-                  ref={videoRef}
-                  playsInline
-                  muted
-                  className="w-full max-h-72 object-contain"
-                />
-                <button
-                  type="button"
-                  onClick={stopCamera}
-                  aria-label="Close camera preview"
-                  className="absolute top-2 right-2 rounded-full bg-navy-900/80 p-2 text-white"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-              <button
-                type="button"
-                onClick={captureFromCamera}
-                className="w-full rounded-xl bg-teal-600 px-4 py-3 min-h-[44px] text-sm font-bold text-white hover:bg-teal-500"
-              >
-                Capture page photo
-              </button>
-            </div>
-          )}
-
-          {!cameraActive && !imagePreviewUrl && (
+          {!imagePreviewUrl && (
             <div
               onDragOver={(e) => e.preventDefault()}
               onDrop={(e) => {
                 e.preventDefault();
                 const file = e.dataTransfer.files?.[0];
-                if (file && file.type.startsWith('image/')) {
-                  loadImageBlob(file);
+                if (file) {
+                  validateAndLoadImage(file, 'drop');
                 }
               }}
               className={`rounded-2xl border-2 border-dashed p-8 text-center space-y-2 ${tokens.border}`}
@@ -729,11 +810,19 @@ export function ScanTextPage({
             </div>
           )}
 
-          {imagePreviewUrl && !cameraActive && (
+          {imagePreviewUrl && (
             <div className="space-y-3">
               <img
                 src={imagePreviewUrl}
                 alt="Selected page preview for OCR"
+                onError={() => {
+                  setError(
+                    'Could not load image preview. The file may be corrupted or in an unsupported format.',
+                  );
+                  if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
+                  setImagePreviewUrl(null);
+                  setSelectedFile(null);
+                }}
                 className={`w-full max-h-80 object-contain rounded-2xl border ${tokens.border} bg-black/5`}
               />
               <button
@@ -753,6 +842,10 @@ export function ScanTextPage({
               </button>
             </div>
           )}
+
+          <p className={`text-xs leading-relaxed ${tokens.subtext}`}>
+            Tip: Use clear images of printed text for better recognition results. Handwritten text may not be recognized accurately.
+          </p>
 
           {scanning && (
             <div className="space-y-1.5" aria-live="polite">
@@ -876,6 +969,7 @@ export function ScanTextPage({
           </div>
         </section>
       </div>
+      )}
     </div>
   );
 }

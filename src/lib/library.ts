@@ -33,7 +33,9 @@ export function countWords(text: string): number {
 export function countSentences(text: string): number {
   const trimmed = text.trim();
   if (!trimmed) return 0;
-  const matches = trimmed.match(/[^.!?]+[.!?]*/g);
+  const matches = trimmed.match(
+    /(?:[^.!?]|[.!?](?!["'”’)\]]*(?:\s|$)))+(?:[.!?]+["'”’)\]]*)?/g,
+  );
   return matches ? matches.filter((s) => s.trim().length > 0).length : 1;
 }
 
@@ -49,11 +51,12 @@ export function loadLibrary(): LibraryItem[] {
   }
 }
 
-function persistLibrary(items: LibraryItem[]): void {
+function persistLibrary(items: LibraryItem[]): boolean {
   try {
     localStorage.setItem(LIBRARY_KEY, JSON.stringify(items));
+    return true;
   } catch {
-    // Ignore storage quota errors gracefully
+    return false;
   }
 }
 
@@ -63,7 +66,7 @@ export function savePassageToLibrary(params: {
   source?: LibraryItem['source'];
   existingId?: string | null;
   progressSentenceIndex?: number;
-}): { items: LibraryItem[]; saved: LibraryItem } {
+}): { items: LibraryItem[]; saved: LibraryItem; persisted: boolean } {
   const items = loadLibrary();
   const now = Date.now();
   const trimmedContent = params.content.trim();
@@ -85,8 +88,8 @@ export function savePassageToLibrary(params: {
           params.progressSentenceIndex ?? items[idx].progressSentenceIndex,
       };
       const next = [updated, ...items.filter((i) => i.id !== params.existingId)];
-      persistLibrary(next);
-      return { items: next, saved: updated };
+      const persisted = persistLibrary(next);
+      return { items: next, saved: updated, persisted };
     }
   }
 
@@ -104,8 +107,8 @@ export function savePassageToLibrary(params: {
         params.progressSentenceIndex ?? duplicate.progressSentenceIndex,
     };
     const next = [updated, ...items.filter((i) => i.id !== duplicate.id)];
-    persistLibrary(next);
-    return { items: next, saved: updated };
+    const persisted = persistLibrary(next);
+    return { items: next, saved: updated, persisted };
   }
 
   const created: LibraryItem = {
@@ -123,8 +126,8 @@ export function savePassageToLibrary(params: {
   };
 
   const next = [created, ...items];
-  persistLibrary(next);
-  return { items: next, saved: created };
+  const persisted = persistLibrary(next);
+  return { items: next, saved: created, persisted };
 }
 
 export function renameLibraryItem(id: string, title: string): LibraryItem[] {

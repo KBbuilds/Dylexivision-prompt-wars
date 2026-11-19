@@ -174,7 +174,7 @@ export default function App() {
     ) => {
       const targetContent = (contentToSave ?? text).trim();
       if (!targetContent) return;
-      const { items, saved } = savePassageToLibrary({
+      const { items, saved, persisted } = savePassageToLibrary({
         content: contentToSave ?? text,
         source,
         title,
@@ -182,7 +182,11 @@ export default function App() {
       });
       setLibrary(items);
       setActiveLibraryId(saved.id);
-      setSavedNotice(`Saved "${saved.title}" to My Library.`);
+      setSavedNotice(
+        persisted
+          ? `Saved "${saved.title}" to My Library.`
+          : 'Browser storage is full or blocked—kept in this session only.',
+      );
     },
     [text, activeLibraryId],
   );
@@ -460,7 +464,9 @@ export default function App() {
 
         {route === 'scan' && (
           <ScanTextPage
-            onSendToStudio={(extracted) => handleOpenInStudio(extracted, 'ocr')}
+            onSendToStudio={(extracted, source) =>
+              handleOpenInStudio(extracted, source ?? 'ocr')
+            }
             onSaveToLibrary={(extracted, title) =>
               handleSaveToLibrary(extracted, 'ocr', title)
             }
@@ -493,6 +499,11 @@ export default function App() {
             onOpenItem={handleOpenLibraryItem}
             onSendToAiTools={(item) => {
               setText(item.content);
+              try {
+                localStorage.setItem(TEXT_KEY, item.content);
+              } catch {
+                // ignore
+              }
               setActiveLibraryId(item.id);
               navigate('ai-tools');
             }}

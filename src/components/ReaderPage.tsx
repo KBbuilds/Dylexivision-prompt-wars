@@ -195,36 +195,6 @@ const TAMIL_VOWEL_LEGEND: Array<{
   { sample: 'கொ · கோ · கௌ', markers: 'ொ · ோ · ௌ', nameTa: 'இருபக்க குறியீடு', kind: 'two-part' },
 ];
 
-function renderEnglishLetters(
-  segment: string,
-  mirrorLetterAlert: boolean,
-  boldChars: number,
-  startOffset: number,
-): ReactNode {
-  if (!mirrorLetterAlert && boldChars <= 0) {
-    return segment;
-  }
-
-  return Array.from(segment).map((ch, idx) => {
-    const absIdx = startOffset + idx;
-    const isBold = absIdx < boldChars;
-    const mirrorKey = mirrorLetterAlert ? getMirrorLetterKey(ch) : null;
-    if (!mirrorKey && !isBold) {
-      return <Fragment key={idx}>{ch}</Fragment>;
-    }
-    return (
-      <span
-        key={idx}
-        className={`${isBold ? 'font-bold' : ''} ${
-          mirrorKey ? getMirrorLetterStyle(mirrorKey, false) : ''
-        }`}
-      >
-        {ch}
-      </span>
-    );
-  });
-}
-
 function renderFormattedWord({
   word,
   bionic,
@@ -387,7 +357,6 @@ function renderFormattedWord({
     );
   }
 
-  void renderEnglishLetters;
   return word;
 }
 
@@ -576,14 +545,14 @@ export function ReaderPage({
     setPunctuationPauses(settings.punctuationFocus);
   }, [settings.punctuationFocus, setPunctuationPauses]);
 
-  // Sync initial sentence when reopening a library item
+  // Sync initial sentence when reopening a library item or changing passage
   useEffect(() => {
     const clamped = Math.max(
       0,
       Math.min(initialSentenceIndex, Math.max(0, sentences.length - 1)),
     );
     setSelectedSentenceIndex(clamped);
-  }, [initialSentenceIndex, sentences.length]);
+  }, [text, initialSentenceIndex, sentences.length]);
 
   // Keep chunk index in valid range when chunk size or text changes
   useEffect(() => {
@@ -722,7 +691,12 @@ export function ReaderPage({
         onSettingsChange({ punctuationFocus: !settings.punctuationFocus });
         return;
       }
-      if (e.key === ' ' && target?.tagName !== 'BUTTON') {
+      if (
+        e.key === ' ' &&
+        target?.tagName !== 'BUTTON' &&
+        target?.tagName !== 'A' &&
+        !target?.isContentEditable
+      ) {
         e.preventDefault();
         if (speech.speaking && !speech.paused) {
           speech.pause();
@@ -1329,9 +1303,13 @@ export function ReaderPage({
                   <span
                     className={`rounded-md px-2 py-0.5 text-[11px] font-semibold ${
                       speech.wordSyncStatus === 'supported'
-                        ? 'bg-teal-600/15 text-teal-700 dark:text-teal-300'
+                        ? dark
+                          ? 'bg-teal-500/20 text-teal-300'
+                          : 'bg-teal-600/15 text-teal-700'
                         : speech.wordSyncStatus === 'unsupported'
-                          ? 'bg-amber-400/20 text-amber-800 dark:text-amber-300'
+                          ? dark
+                            ? 'bg-amber-400/20 text-amber-300'
+                            : 'bg-amber-400/20 text-amber-800'
                           : dark
                             ? 'bg-[#0F1B2E] text-[#B8C5D9]'
                             : 'bg-cream-100 text-navy-700'

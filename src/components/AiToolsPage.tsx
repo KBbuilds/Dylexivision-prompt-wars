@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowRight,
   BookMarked,
@@ -118,6 +118,7 @@ export function AiToolsPage({
   const [loadingTool, setLoadingTool] = useState(false);
   const [toolError, setToolError] = useState<string | null>(null);
   const [aiNotice, setAiNotice] = useState<string | null>(null);
+  const [aiNoticeShowOfflineBtn, setAiNoticeShowOfflineBtn] = useState(false);
   const [resultText, setResultText] = useState('');
   const [resultSource, setResultSource] = useState<string>('');
   const [resultKind, setResultKind] = useState<'ai' | 'offline' | null>(null);
@@ -139,6 +140,9 @@ export function AiToolsPage({
   const [dictSource, setDictSource] = useState<string>('');
   const [dictError, setDictError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  const aiRequestIdRef = useRef(0);
+  const dictRequestIdRef = useRef(0);
 
   const difficultWords = useMemo(() => detectDifficultWords(text), [text]);
   const longTamilWords = useMemo(() => detectLongTamilWords(text), [text]);
@@ -171,8 +175,11 @@ export function AiToolsPage({
   }, []);
 
   const clearOutputs = (clearDictionary = false) => {
+    aiRequestIdRef.current += 1;
+    setLoadingTool(false);
     setToolError(null);
     setAiNotice(null);
+    setAiNoticeShowOfflineBtn(false);
     setResultText('');
     setResultSource('');
     setResultKind(null);
@@ -184,6 +191,8 @@ export function AiToolsPage({
     setOfflineRecall([]);
     setCopiedId(null);
     if (clearDictionary) {
+      dictRequestIdRef.current += 1;
+      setDictLoading(false);
       setDictResult(null);
       setDictSource('');
       setDictError(null);
@@ -193,6 +202,7 @@ export function AiToolsPage({
   const lookupDictionaryWord = async (wordToFind: string) => {
     const clean = wordToFind.trim();
     if (!clean) return;
+    const reqId = ++dictRequestIdRef.current;
     setWordInput(clean);
     setDictLoading(true);
     setDictError(null);
@@ -203,6 +213,7 @@ export function AiToolsPage({
       const res = await fetch(
         `/api/dictionary?word=${encodeURIComponent(clean)}`,
       );
+      if (reqId !== dictRequestIdRef.current) return;
       const raw = await res.text();
       let data: (DictionaryResult & { message?: string }) | null = null;
       try {
@@ -210,6 +221,7 @@ export function AiToolsPage({
       } catch {
         data = null;
       }
+      if (reqId !== dictRequestIdRef.current) return;
       if (!res.ok || !data) {
         setDictError(
           data?.message || `No dictionary or synonym entry found for "${clean}".`,
@@ -219,9 +231,14 @@ export function AiToolsPage({
         setDictSource('Free Dictionary & Thesaurus (dictionaryapi.dev / Datamuse)');
       }
     } catch {
-      setDictError('Could not reach the free dictionary service right now.');
+      if (reqId !== dictRequestIdRef.current) return;
+      setDictError(
+        'Could not reach the free online dictionary service right now (requires internet connectivity).',
+      );
     } finally {
-      setDictLoading(false);
+      if (reqId === dictRequestIdRef.current) {
+        setDictLoading(false);
+      }
     }
   };
 
@@ -248,6 +265,7 @@ export function AiToolsPage({
       case 'simplify': {
         const { simplified, changes, changed } = simplifyTextOffline(text);
         if (!changed) {
+          setAiNoticeShowOfflineBtn(false);
           setAiNotice(
             'Offline rules did not find formal substitutions or long compound sentences to shorten in this passage. Use Gemini AI for deeper rewriting.',
           );
@@ -262,6 +280,7 @@ export function AiToolsPage({
       case 'easier-english': {
         const { simplified, changes, changed } = easierEnglishOffline(text);
         if (!changed) {
+          setAiNoticeShowOfflineBtn(false);
           setAiNotice(
             containsTamilScript(text)
               ? 'ஆஃப்லைன் விதிகள் மாற்ற வேண்டிய கடினச் சொற்களைக் கண்டறியவில்லை. முழு எளிய தமிழ் (Easy Tamil) மாற்றத்திற்கு Gemini AI-ஐப் பயன்படுத்தவும்.'
@@ -331,7 +350,7 @@ export function AiToolsPage({
       case 'synonyms': {
         if (wordInput.trim() && containsTamilScript(wordInput)) {
           setToolError(
-            'Free offline dictionary lookup supports English words only. Click "Run with Gemini AI" for Tamil word explanations and synonyms.',
+            'Free dictionary lookup supports English words only. Click "Run with Gemini AI" for Tamil word explanations and synonyms.',
           );
           return;
         }
@@ -343,7 +362,7 @@ export function AiToolsPage({
           void lookupDictionaryWord(candidateWord);
         } else if (containsTamilScript(text)) {
           setToolError(
-            'Free offline dictionary lookup only covers English words. Click "Run with Gemini AI" above to get Tamil word explanations and synonyms.',
+            'Free dictionary lookup only covers English words. Click "Run with Gemini AI" above to get Tamil word explanations and synonyms.',
           );
         } else {
           setToolError(
@@ -364,6 +383,7 @@ export function AiToolsPage({
       return;
     }
 
+    const reqId = ++aiRequestIdRef.current;
     setLoadingTool(true);
     const controller = new AbortController();
     const abortTimer = window.setTimeout(() => controller.abort(), 48000);
@@ -383,6 +403,7 @@ export function AiToolsPage({
       });
 
       const raw = await res.text();
+      if (reqId !== aiRequestIdRef.current) return;
       type AiTransformResponse = {
         error?: string;
         message?: string;
@@ -400,8 +421,11 @@ export function AiToolsPage({
         data = null;
       }
 
+      if (reqId !== aiRequestIdRef.current) return;
+
       if (!res.ok) {
         if (data?.error === 'AI_NOT_CONFIGURED') {
+          setAiNoticeShowOfflineBtn(true);
           setAiNotice(
             data.message ||
               'Gemini AI integration is not configured on the server yet. Use the Offline / Free alternative below—no fake AI output is generated.',
@@ -446,6 +470,7 @@ export function AiToolsPage({
         );
       }
     } catch (err) {
+      if (reqId !== aiRequestIdRef.current) return;
       if (err instanceof Error && err.name === 'AbortError') {
         setToolError(
           'The AI request timed out while waiting for the server. Try a shorter passage or use the Offline / Free alternative below.',
@@ -457,7 +482,9 @@ export function AiToolsPage({
       }
     } finally {
       window.clearTimeout(abortTimer);
-      setLoadingTool(false);
+      if (reqId === aiRequestIdRef.current) {
+        setLoadingTool(false);
+      }
     }
   };
 
@@ -633,7 +660,9 @@ export function AiToolsPage({
                     disabled={loadingTool}
                     className={`inline-flex items-center gap-2 rounded-xl border px-4 py-2.5 min-h-[42px] text-sm font-semibold whitespace-nowrap ${tokens.secondaryBtn}`}
                   >
-                    Run Offline / Free
+                    {selectedTool === 'explain-words' || selectedTool === 'synonyms'
+                      ? 'Run Free Lookup'
+                      : 'Run Offline'}
                   </button>
                   <button
                     type="button"
@@ -752,7 +781,7 @@ export function AiToolsPage({
                                 : 'border-cream-200 bg-white text-navy-700'
                             }`}
                           >
-                            Offline / Free Lookup
+                            Free Dictionary Lookup
                           </span>
                           <span className={`text-xs font-medium ${tokens.subtext}`}>
                             {dictSource}
@@ -830,13 +859,15 @@ export function AiToolsPage({
                   className="rounded-xl border border-amber-400/50 bg-amber-400/10 px-4 py-3 text-sm font-medium flex flex-wrap items-center justify-between gap-3"
                 >
                   <span>{aiNotice}</span>
-                  <button
-                    type="button"
-                    onClick={() => runOfflineTool(selectedTool)}
-                    className={`rounded-lg border px-3 py-1.5 text-xs font-bold whitespace-nowrap ${tokens.secondaryBtn}`}
-                  >
-                    Use Offline / Free Alternative
-                  </button>
+                  {aiNoticeShowOfflineBtn && (
+                    <button
+                      type="button"
+                      onClick={() => runOfflineTool(selectedTool)}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-bold whitespace-nowrap ${tokens.secondaryBtn}`}
+                    >
+                      Use Offline / Free Alternative
+                    </button>
+                  )}
                 </div>
               )}
               {toolError && (

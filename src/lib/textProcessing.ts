@@ -17,6 +17,15 @@ export interface ReadingChunk {
   paragraphs: ParagraphBlock[];
 }
 
+const SAFE_SENTENCE_RE =
+  /(?:[^.!?]|[.!?](?!["'”’)\]]*(?:\s|$)))+(?:[.!?]+["'”’)\]]*)?/g;
+
+export function splitSentences(para: string): string[] {
+  const matches = para.match(SAFE_SENTENCE_RE) ?? [para];
+  const cleaned = matches.map((s) => s.trim()).filter((s) => s.length > 0);
+  return cleaned.length > 0 ? cleaned : [para.trim()].filter(Boolean);
+}
+
 export function parsePassage(rawText: string): {
   paragraphs: ParagraphBlock[];
   sentences: SentenceItem[];
@@ -31,11 +40,7 @@ export function parsePassage(rawText: string): {
   let globalIndex = 0;
 
   rawParagraphs.forEach((para, pIdx) => {
-    const rawSentences =
-      para.match(/[^.!?]+(?:[.!?]+["'”’)]*)?(?=\s|$)/g) ?? [para];
-    const cleanSentences = rawSentences
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+    const cleanSentences = splitSentences(para);
 
     const items: SentenceItem[] = (
       cleanSentences.length > 0 ? cleanSentences : [para]
@@ -289,8 +294,7 @@ export function simplifyTextOffline(text: string): {
     }
 
     // 2. Break very long sentences at clause markers
-    const rawSentences =
-      replaced.match(/[^.!?]+[.!?]*/g)?.map((s) => s.trim()) ?? [replaced];
+    const rawSentences = splitSentences(replaced);
 
     const shortSentences: string[] = [];
     const wordThreshold = isTamilPara ? 12 : 16;
@@ -373,7 +377,9 @@ export function easierEnglishOffline(text: string): {
   const phraseChanges: Array<{ original: string; simpler: string }> = [];
 
   for (const [pattern, replacement, label] of EASIER_PHRASES) {
+    pattern.lastIndex = 0;
     if (pattern.test(working)) {
+      pattern.lastIndex = 0;
       phraseChanges.push({ original: label, simpler: replacement });
       working = working.replace(pattern, (match) =>
         match[0] === match[0].toUpperCase()
@@ -566,8 +572,13 @@ export function generateOfflineRecallPractice(text: string): RecallItem[] {
 
     if (!target) continue;
     const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escaped);
-    const prompt = sentence.replace(regex, '______');
+    const isAsciiWord = /^[A-Za-z0-9]+$/.test(target);
+    const regex = isAsciiWord
+      ? new RegExp(`\\b${escaped}\\b`)
+      : new RegExp(`(^|[\\s,.?!;:"'“”‘’()\\[\\]])${escaped}(?=$|[\\s,.?!;:"'“”‘’()\\[\\]])`, 'u');
+    const prompt = isAsciiWord
+      ? sentence.replace(regex, '______')
+      : sentence.replace(regex, '$1______');
     if (prompt !== sentence) {
       items.push({
         prompt,
@@ -708,14 +719,19 @@ export function detectSentenceEndPunctuation(sentenceText: string): {
 export type MirrorLetterKey = 'b' | 'd' | 'p' | 'q' | 'm' | 'w';
 
 export function getMirrorLetterKey(ch: string): MirrorLetterKey | null {
-  switch (ch) {
+  switch (ch.toLowerCase()) {
     case 'b':
+      return 'b';
     case 'd':
+      return 'd';
     case 'p':
+      return 'p';
     case 'q':
+      return 'q';
     case 'm':
+      return 'm';
     case 'w':
-      return ch;
+      return 'w';
     default:
       return null;
   }

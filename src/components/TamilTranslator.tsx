@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeftRight,
@@ -47,6 +47,7 @@ export function TamilTranslator({
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
+  const translateReqIdRef = useRef(0);
 
   const sourceMeta = getLanguageMeta(sourceLang);
   const targetMeta = getLanguageMeta(targetLang);
@@ -76,6 +77,8 @@ export function TamilTranslator({
   };
 
   const handleClear = () => {
+    translateReqIdRef.current += 1;
+    setTranslating(false);
     setInputText('');
     setOutputText('');
     setProvider(null);
@@ -95,43 +98,64 @@ export function TamilTranslator({
       return;
     }
 
+    const reqId = ++translateReqIdRef.current;
     setTranslating(true);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 30000);
+
     try {
       const res = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           text: inputText,
           sourceLang,
           targetLang,
         }),
       });
-      const data = (await res.json()) as {
+      if (reqId !== translateReqIdRef.current) return;
+
+      const raw = await res.text();
+      interface TranslateApiResponse {
         translatedText?: string;
         provider?: string;
         message?: string;
         error?: string;
-      };
+      }
+      let data: TranslateApiResponse | null = null;
+      try {
+        data = JSON.parse(raw) as TranslateApiResponse;
+      } catch {
+        data = null;
+      }
+      if (reqId !== translateReqIdRef.current) return;
 
-      if (!res.ok || !data.translatedText) {
+      if (!res.ok || !data?.translatedText) {
         setOutputText('');
         setProvider(null);
         setError(
-          data.message ||
+          data?.message ||
             'Translation service is unavailable. Verify internet connectivity or configure GEMINI_API_KEY on the server.',
         );
       } else {
         setOutputText(data.translatedText);
         setProvider(data.provider ?? null);
       }
-    } catch {
+    } catch (err) {
+      if (reqId !== translateReqIdRef.current) return;
       setOutputText('');
       setProvider(null);
       setError(
-        'Could not reach the translation server endpoint (/api/translate). Check your connection or configure GEMINI_API_KEY in Settings > Secrets.',
+        err instanceof Error && err.name === 'AbortError'
+          ? 'Translation request timed out. Try a shorter passage or retry.'
+          : 'Could not reach the translation server endpoint (/api/translate). Check your connection or configure GEMINI_API_KEY in Settings > Secrets.',
       );
     } finally {
-      setTranslating(false);
+      window.clearTimeout(timer);
+      if (reqId === translateReqIdRef.current) {
+        setTranslating(false);
+      }
     }
   };
 

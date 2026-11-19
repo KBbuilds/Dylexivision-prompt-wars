@@ -77,19 +77,32 @@ export function ReadingRuler({
       ) {
         return;
       }
+      const step = Math.max(24, Math.round(effectiveHeight * 0.65));
+      const container = containerRef.current;
+      const maxH = container ? container.clientHeight : 600;
       if (e.key === 'ArrowDown' || e.key === 'j') {
         e.preventDefault();
         setLocked(true);
-        moveRuler(Math.max(24, Math.round(effectiveHeight * 0.65)));
+        setRulerY((prev) =>
+          Math.max(
+            effectiveHeight / 2,
+            Math.min(maxH - effectiveHeight / 2, prev + step),
+          ),
+        );
       } else if (e.key === 'ArrowUp' || e.key === 'k') {
         e.preventDefault();
         setLocked(true);
-        moveRuler(-Math.max(24, Math.round(effectiveHeight * 0.65)));
+        setRulerY((prev) =>
+          Math.max(
+            effectiveHeight / 2,
+            Math.min(maxH - effectiveHeight / 2, prev - step),
+          ),
+        );
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  });
+  }, [enabled, effectiveHeight]);
 
   if (!enabled) {
     return <>{children}</>;
