@@ -8,12 +8,14 @@ import {
   type ReactNode,
 } from 'react';
 import {
+  BookOpenText,
   BookmarkCheck,
   ChevronLeft,
   ChevronRight,
   Eye,
   Home,
   Info,
+  Loader2,
   Maximize2,
   Minimize2,
   Pause,
@@ -28,15 +30,29 @@ import {
 import { SliderControl } from '@/components/Controls';
 import { ReadingRuler } from '@/components/ReadingRuler';
 import { SpeechPanel } from '@/components/SpeechPanel';
+import { containsTamilScript } from '@/lib/languages';
 import {
+  analyzeEnglishMorphologyOffline,
+  analyzeTamilWordOffline,
   buildReadingChunks,
+  classifyTamilGraphemeVowel,
+  detectDifficultWords,
+  detectLongTamilWords,
   detectSentenceEndPunctuation,
   findWordIndexAtCharOffset,
+  getMirrorLetterKey,
+  groupTamilSoundUnits,
   parsePassage,
+  segmentTamilGraphemes,
   splitBionicToken,
+  splitEnglishSyllables,
   tokenizeSentence,
+  type EnglishMorphologyAnalysis,
+  type MirrorLetterKey,
   type ParagraphBlock,
   type PunctuationKind,
+  type TamilSandhiAnalysis,
+  type TamilVowelMarkerKind,
 } from '@/lib/textProcessing';
 import type { SpeechController } from '@/hooks/useSpeech';
 import {
@@ -67,7 +83,7 @@ interface ReaderPageProps {
   savedNotice: string | null;
 }
 
-type SidebarTab = 'typography' | 'themes' | 'aids' | 'speech';
+type SidebarTab = 'typography' | 'themes' | 'aids' | 'tools' | 'speech';
 
 function getPunctuationStyle(kind: PunctuationKind | undefined, dark: boolean): string {
   switch (kind) {
@@ -95,6 +111,62 @@ function getPunctuationStyle(kind: PunctuationKind | undefined, dark: boolean): 
   }
 }
 
+function getMirrorLetterStyle(key: MirrorLetterKey, dark: boolean): string {
+  switch (key) {
+    case 'b':
+      return dark
+        ? 'bg-teal-500/25 text-teal-200 border-b-2 border-teal-400 rounded-[2px] px-[0.5px]'
+        : 'bg-teal-500/15 text-teal-900 border-b-2 border-teal-600 rounded-[2px] px-[0.5px]';
+    case 'd':
+      return dark
+        ? 'bg-amber-400/25 text-amber-200 border-b-2 border-amber-400 rounded-[2px] px-[0.5px]'
+        : 'bg-amber-400/20 text-amber-900 border-b-2 border-amber-600 rounded-[2px] px-[0.5px]';
+    case 'p':
+      return dark
+        ? 'bg-sky-400/25 text-sky-200 border-b-2 border-sky-400 rounded-[2px] px-[0.5px]'
+        : 'bg-sky-500/15 text-sky-900 border-b-2 border-sky-600 rounded-[2px] px-[0.5px]';
+    case 'q':
+      return dark
+        ? 'bg-coral-500/25 text-[#FF9E94] border-b-2 border-coral-400 rounded-[2px] px-[0.5px]'
+        : 'bg-coral-500/15 text-coral-600 border-b-2 border-coral-600 rounded-[2px] px-[0.5px]';
+    case 'm':
+      return dark
+        ? 'bg-violet-400/25 text-violet-200 border-b-2 border-violet-400 rounded-[2px] px-[0.5px]'
+        : 'bg-violet-500/15 text-violet-900 border-b-2 border-violet-600 rounded-[2px] px-[0.5px]';
+    case 'w':
+      return dark
+        ? 'bg-emerald-400/25 text-emerald-200 border-b-2 border-emerald-400 rounded-[2px] px-[0.5px]'
+        : 'bg-emerald-500/15 text-emerald-900 border-b-2 border-emerald-600 rounded-[2px] px-[0.5px]';
+  }
+}
+
+function getTamilVowelStyle(kind: TamilVowelMarkerKind, dark: boolean): string {
+  switch (kind) {
+    case 'aa-kal':
+      return dark
+        ? 'bg-amber-400/20 text-amber-200 rounded-[3px] px-[1px]'
+        : 'bg-amber-400/25 text-amber-950 rounded-[3px] px-[1px]';
+    case 'i-ee':
+      return dark
+        ? 'bg-teal-400/20 text-teal-200 rounded-[3px] px-[1px]'
+        : 'bg-teal-500/15 text-teal-950 rounded-[3px] px-[1px]';
+    case 'u-uu':
+      return dark
+        ? 'bg-sky-400/20 text-sky-200 rounded-[3px] px-[1px]'
+        : 'bg-sky-500/15 text-sky-950 rounded-[3px] px-[1px]';
+    case 'e-ee-ai':
+      return dark
+        ? 'bg-violet-400/20 text-violet-200 rounded-[3px] px-[1px]'
+        : 'bg-violet-500/15 text-violet-950 rounded-[3px] px-[1px]';
+    case 'two-part':
+      return dark
+        ? 'bg-coral-500/25 text-[#FFAD9F] rounded-[3px] px-[1px]'
+        : 'bg-coral-500/15 text-coral-700 rounded-[3px] px-[1px]';
+    default:
+      return '';
+  }
+}
+
 const PUNCTUATION_LEGEND_ITEMS: Array<{
   symbol: string;
   name: string;
@@ -110,10 +182,223 @@ const PUNCTUATION_LEGEND_ITEMS: Array<{
   { symbol: '“ ”', name: 'Quotation marks', purpose: 'Marks speech or quotes', kind: 'quote' },
 ];
 
+const TAMIL_VOWEL_LEGEND: Array<{
+  sample: string;
+  markers: string;
+  nameTa: string;
+  kind: TamilVowelMarkerKind;
+}> = [
+  { sample: 'கா', markers: 'ா', nameTa: 'துணைக்கால்', kind: 'aa-kal' },
+  { sample: 'கி · கீ', markers: 'ி · ீ', nameTa: 'இ / ஈ குறியீடு', kind: 'i-ee' },
+  { sample: 'கு · கூ', markers: 'ு · ூ', nameTa: 'உ / ஊ வளைவு', kind: 'u-uu' },
+  { sample: 'கெ · கே · கை', markers: 'ெ · ே · ை', nameTa: 'கொம்பு வகை', kind: 'e-ee-ai' },
+  { sample: 'கொ · கோ · கௌ', markers: 'ொ · ோ · ௌ', nameTa: 'இருபக்க குறியீடு', kind: 'two-part' },
+];
+
+function renderEnglishLetters(
+  segment: string,
+  mirrorLetterAlert: boolean,
+  boldChars: number,
+  startOffset: number,
+): ReactNode {
+  if (!mirrorLetterAlert && boldChars <= 0) {
+    return segment;
+  }
+
+  return Array.from(segment).map((ch, idx) => {
+    const absIdx = startOffset + idx;
+    const isBold = absIdx < boldChars;
+    const mirrorKey = mirrorLetterAlert ? getMirrorLetterKey(ch) : null;
+    if (!mirrorKey && !isBold) {
+      return <Fragment key={idx}>{ch}</Fragment>;
+    }
+    return (
+      <span
+        key={idx}
+        className={`${isBold ? 'font-bold' : ''} ${
+          mirrorKey ? getMirrorLetterStyle(mirrorKey, false) : ''
+        }`}
+      >
+        {ch}
+      </span>
+    );
+  });
+}
+
+function renderFormattedWord({
+  word,
+  bionic,
+  mirrorLetterAlert,
+  englishSyllables,
+  tamilSyllableGrouping,
+  tamilVowelHighlight,
+  dark,
+}: {
+  word: string;
+  bionic: boolean;
+  mirrorLetterAlert: boolean;
+  englishSyllables: boolean;
+  tamilSyllableGrouping: boolean;
+  tamilVowelHighlight: boolean;
+  dark: boolean;
+}): ReactNode {
+  const isTamilWord = containsTamilScript(word);
+
+  if (isTamilWord) {
+    if (!tamilSyllableGrouping && !tamilVowelHighlight) {
+      return word;
+    }
+
+    const units = tamilSyllableGrouping
+      ? groupTamilSoundUnits(word)
+      : [word];
+
+    return units.map((unit, uIdx) => {
+      const graphemes = tamilVowelHighlight ? segmentTamilGraphemes(unit) : [unit];
+      const inner = tamilVowelHighlight
+        ? graphemes.map((g, gIdx) => {
+            const info = classifyTamilGraphemeVowel(g);
+            if (info.kind === 'none' || info.kind === 'pulli') {
+              return <Fragment key={gIdx}>{g}</Fragment>;
+            }
+            return (
+              <span key={gIdx} className={getTamilVowelStyle(info.kind, dark)}>
+                {g}
+              </span>
+            );
+          })
+        : unit;
+
+      if (!tamilSyllableGrouping || units.length <= 1) {
+        return <Fragment key={uIdx}>{inner}</Fragment>;
+      }
+
+      const isLast = uIdx === units.length - 1;
+      return (
+        <span
+          key={uIdx}
+          className={`inline ${
+            uIdx % 2 === 1
+              ? dark
+                ? 'bg-white/5 rounded-[3px]'
+                : 'bg-teal-500/8 rounded-[3px]'
+              : ''
+          } ${
+            !isLast
+              ? 'border-r border-teal-500/40 pr-[2px] mr-[2px]'
+              : ''
+          }`}
+        >
+          {inner}
+        </span>
+      );
+    });
+  }
+
+  // English / Latin word formatting
+  const bionicSplit = bionic ? splitBionicToken(word) : null;
+  const boldCount = bionicSplit?.boldPart ? bionicSplit.boldPart.length : 0;
+  const leadingLen = bionicSplit?.leadingPunct.length ?? 0;
+
+  // English syllable splitting only on pure Latin words when enabled
+  const canSyllabify = englishSyllables && /^[A-Za-z]+$/.test(word);
+  if (canSyllabify) {
+    const syllables = splitEnglishSyllables(word);
+    if (syllables.length > 1) {
+      let runningOffset = 0;
+      return syllables.map((syl, sIdx) => {
+        const startOffset = runningOffset;
+        runningOffset += syl.length;
+        const isLast = sIdx === syllables.length - 1;
+
+        const sylNodes = Array.from(syl).map((ch, cIdx) => {
+          const globalPos = startOffset + cIdx;
+          const isBold = globalPos < boldCount;
+          const mirrorKey = mirrorLetterAlert ? getMirrorLetterKey(ch) : null;
+          if (!isBold && !mirrorKey) {
+            return <Fragment key={cIdx}>{ch}</Fragment>;
+          }
+          return (
+            <span
+              key={cIdx}
+              className={`${isBold ? 'font-bold' : ''} ${
+                mirrorKey ? getMirrorLetterStyle(mirrorKey, dark) : ''
+              }`}
+            >
+              {ch}
+            </span>
+          );
+        });
+
+        return (
+          <span
+            key={sIdx}
+            className={`inline ${
+              sIdx % 2 === 1
+                ? dark
+                  ? 'bg-white/5 rounded-[3px]'
+                  : 'bg-teal-500/10 rounded-[3px]'
+                : ''
+            } ${
+              !isLast
+                ? 'border-r border-current/25 pr-[1.5px] mr-[1.5px]'
+                : ''
+            }`}
+          >
+            {sylNodes}
+          </span>
+        );
+      });
+    }
+  }
+
+  if (mirrorLetterAlert) {
+    return Array.from(word).map((ch, idx) => {
+      const mirrorKey = getMirrorLetterKey(ch);
+      const isBold =
+        bionic &&
+        boldCount > 0 &&
+        idx >= leadingLen &&
+        idx < leadingLen + boldCount;
+      if (!mirrorKey && !isBold) {
+        return <Fragment key={idx}>{ch}</Fragment>;
+      }
+      return (
+        <span
+          key={idx}
+          className={`${isBold ? 'font-bold' : ''} ${
+            mirrorKey ? getMirrorLetterStyle(mirrorKey, dark) : ''
+          }`}
+        >
+          {ch}
+        </span>
+      );
+    });
+  }
+
+  if (bionic && bionicSplit?.boldPart) {
+    return (
+      <>
+        {bionicSplit.leadingPunct}
+        <strong className="font-bold">{bionicSplit.boldPart}</strong>
+        {bionicSplit.restPart}
+        {bionicSplit.trailingPunct}
+      </>
+    );
+  }
+
+  void renderEnglishLetters;
+  return word;
+}
+
 function RenderSentenceText({
   text,
   bionic,
   punctuationFocus,
+  mirrorLetterAlert,
+  englishSyllables,
+  tamilSyllableGrouping,
+  tamilVowelHighlight,
   karaokeMode,
   isSpokenSentence,
   activeWordIndex,
@@ -124,6 +409,10 @@ function RenderSentenceText({
   text: string;
   bionic: boolean;
   punctuationFocus: boolean;
+  mirrorLetterAlert: boolean;
+  englishSyllables: boolean;
+  tamilSyllableGrouping: boolean;
+  tamilVowelHighlight: boolean;
   karaokeMode: boolean;
   isSpokenSentence: boolean;
   activeWordIndex: number | null;
@@ -131,9 +420,21 @@ function RenderSentenceText({
   onWordClick?: (charStart: number) => void;
   activeWordRef?: (el: HTMLSpanElement | null) => void;
 }) {
-  const tokens = useMemo(() => tokenizeSentence(text), [text]);
+  const anyAidActive =
+    bionic ||
+    punctuationFocus ||
+    mirrorLetterAlert ||
+    englishSyllables ||
+    tamilSyllableGrouping ||
+    tamilVowelHighlight ||
+    karaokeMode;
 
-  if (!bionic && !punctuationFocus && !karaokeMode) {
+  const tokens = useMemo(
+    () => (anyAidActive ? tokenizeSentence(text) : []),
+    [text, anyAidActive],
+  );
+
+  if (!anyAidActive) {
     return <>{text}</>;
   }
 
@@ -166,22 +467,15 @@ function RenderSentenceText({
           );
         }
 
-        // token.kind === 'word'
-        let wordContent: ReactNode = token.text;
-        if (bionic) {
-          const { leadingPunct, boldPart, restPart, trailingPunct } =
-            splitBionicToken(token.text);
-          if (boldPart) {
-            wordContent = (
-              <>
-                {leadingPunct}
-                <strong className="font-bold">{boldPart}</strong>
-                {restPart}
-                {trailingPunct}
-              </>
-            );
-          }
-        }
+        const wordContent = renderFormattedWord({
+          word: token.text,
+          bionic,
+          mirrorLetterAlert,
+          englishSyllables,
+          tamilSyllableGrouping,
+          tamilVowelHighlight,
+          dark,
+        });
 
         if (!karaokeMode) {
           return <Fragment key={idx}>{wordContent}</Fragment>;
@@ -195,6 +489,7 @@ function RenderSentenceText({
             key={idx}
             ref={isActiveWord ? activeWordRef : undefined}
             onClick={(e) => {
+              if (window.getSelection()?.toString()) return;
               e.stopPropagation();
               onWordClick?.(token.charStart);
             }}
@@ -244,10 +539,25 @@ export function ReaderPage({
   const [selectedSentenceIndex, setSelectedSentenceIndex] = useState<number>(
     initialSentenceIndex,
   );
-  const [clickToSpeak, setClickToSpeak] = useState(true);
   const [chunkIndex, setChunkIndex] = useState(0);
   const [showFocusSidebar, setShowFocusSidebar] = useState(false);
   const [showPunctLegend, setShowPunctLegend] = useState(false);
+  const [showMirrorHint, setShowMirrorHint] = useState(false);
+  const [showTamilVowelLegend, setShowTamilVowelLegend] = useState(false);
+
+  // English Prefix/Root/Suffix Explorer state
+  const englishPassageWords = useMemo(() => detectDifficultWords(text, 8), [text]);
+  const [morphWordInput, setMorphWordInput] = useState('');
+  const [morphResult, setMorphResult] = useState<EnglishMorphologyAnalysis | null>(null);
+  const [morphLoading, setMorphLoading] = useState(false);
+  const [morphError, setMorphError] = useState<string | null>(null);
+
+  // Tamil Compound Word Splitter (சந்தி பிரித்தல்) state
+  const tamilPassageWords = useMemo(() => detectLongTamilWords(text, 8), [text]);
+  const [sandhiWordInput, setSandhiWordInput] = useState('');
+  const [sandhiResult, setSandhiResult] = useState<TamilSandhiAnalysis | null>(null);
+  const [sandhiLoading, setSandhiLoading] = useState(false);
+  const [sandhiError, setSandhiError] = useState<string | null>(null);
 
   const sentenceRefs = useRef<Record<number, HTMLSpanElement | null>>({});
   const activeWordElRef = useRef<HTMLSpanElement | null>(null);
@@ -460,15 +770,17 @@ export function ReaderPage({
     onSettingsChange,
   ]);
 
+  // Never automatically speak when clicking, touching, selecting, scrolling, or copying text
   const handleSentenceClick = (sentenceIdx: number) => {
-    setSelectedSentenceIndex(sentenceIdx);
-    if ((clickToSpeak || settings.readingMode === 'karaoke') && speech.supported) {
-      speech.playSentences(sentenceTexts, sentenceIdx);
+    if (window.getSelection()?.toString()) return;
+    if (isSentenceFocusMode) {
+      setSelectedSentenceIndex(sentenceIdx);
     }
   };
 
   const handleWordClick = useCallback(
     (sentenceIdx: number, charStart: number) => {
+      if (window.getSelection()?.toString()) return;
       setSelectedSentenceIndex(sentenceIdx);
       if (speech.supported) {
         speech.playFromWord(sentenceTexts, sentenceIdx, charStart);
@@ -476,6 +788,82 @@ export function ReaderPage({
     },
     [speech, sentenceTexts],
   );
+
+  const runEnglishMorphology = async (wordToAnalyze: string, useAi: boolean) => {
+    const clean = wordToAnalyze.trim();
+    if (!clean) {
+      setMorphError('Enter or select an English word first.');
+      return;
+    }
+    setMorphWordInput(clean);
+    setMorphError(null);
+    if (!useAi) {
+      setMorphResult(analyzeEnglishMorphologyOffline(clean));
+      return;
+    }
+    setMorphLoading(true);
+    try {
+      const res = await fetch('/api/reading-tools/english-morphology', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          word: clean,
+          context: sentences[activeHighlightIndex]?.text,
+        }),
+      });
+      const data = (await res.json()) as EnglishMorphologyAnalysis & { message?: string };
+      if (!res.ok) {
+        setMorphError(data.message || 'AI morphology unavailable; showing offline rule-based breakdown.');
+        setMorphResult(analyzeEnglishMorphologyOffline(clean));
+      } else {
+        setMorphResult({ ...data, provider: 'gemini' });
+      }
+    } catch {
+      setMorphError('Could not reach AI service; showing offline rule-based breakdown.');
+      setMorphResult(analyzeEnglishMorphologyOffline(clean));
+    } finally {
+      setMorphLoading(false);
+    }
+  };
+
+  const runTamilSandhi = async (wordToSplit: string, useAi: boolean) => {
+    const clean = wordToSplit.trim();
+    if (!clean || !containsTamilScript(clean)) {
+      setSandhiError('சந்தி பிரிப்பதற்கு ஒரு தமிழ் சொல்லை உள்ளிடவும்.');
+      return;
+    }
+    setSandhiWordInput(clean);
+    setSandhiError(null);
+    if (!useAi) {
+      setSandhiResult(analyzeTamilWordOffline(clean));
+      return;
+    }
+    setSandhiLoading(true);
+    try {
+      const res = await fetch('/api/reading-tools/tamil-sandhi', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          word: clean,
+          context: sentences[activeHighlightIndex]?.text,
+        }),
+      });
+      const data = (await res.json()) as TamilSandhiAnalysis & { message?: string };
+      if (!res.ok) {
+        setSandhiError(
+          data.message || 'AI சந்தி பிரிப்பு இப்போது கிடைக்கவில்லை; அடிப்படைப் பிரிப்பு காட்டப்படுகிறது.',
+        );
+        setSandhiResult(analyzeTamilWordOffline(clean));
+      } else {
+        setSandhiResult({ ...data, provider: 'gemini' });
+      }
+    } catch {
+      setSandhiError('AI சேவையைத் தொடர்பு கொள்ள முடியவில்லை; அடிப்படைப் பிரிப்பு காட்டப்படுகிறது.');
+      setSandhiResult(analyzeTamilWordOffline(clean));
+    } finally {
+      setSandhiLoading(false);
+    }
+  };
 
   const isFocusMode = settings.readingMode === 'focus';
   const isSentenceFocusMode = settings.readingMode === 'sentence-focus';
@@ -572,7 +960,7 @@ export function ReaderPage({
                         sentenceRefs.current[sent.index] = el;
                       }}
                       onClick={() => handleSentenceClick(sent.index)}
-                      className={`cursor-pointer rounded-md px-1 py-0.5 transition-colors ${
+                      className={`rounded-md px-1 py-0.5 transition-colors ${
                         isActive ? tokens.highlightSentence : ''
                       }`}
                     >
@@ -580,6 +968,10 @@ export function ReaderPage({
                         text={sent.text}
                         bionic={settings.bionicReading}
                         punctuationFocus={settings.punctuationFocus}
+                        mirrorLetterAlert={settings.mirrorLetterAlert}
+                        englishSyllables={settings.englishSyllables}
+                        tamilSyllableGrouping={settings.tamilSyllableGrouping}
+                        tamilVowelHighlight={settings.tamilVowelHighlight}
                         karaokeMode={isKaraokeMode}
                         isSpokenSentence={isSpoken}
                         activeWordIndex={isSpoken ? activeSpokenWordIndex : null}
@@ -630,29 +1022,30 @@ export function ReaderPage({
                     sentenceRefs.current[sent.index] = el;
                   }}
                   onClick={() => handleSentenceClick(sent.index)}
-                  title={
-                    isKaraokeMode
-                      ? 'Click any word to read aloud from that word'
-                      : 'Click sentence to focus or read from here'
-                  }
-                  className={`cursor-pointer rounded-md px-1 py-0.5 transition-all ${
+                  className={`rounded-md px-1 py-0.5 transition-all ${
+                    isSentenceFocusMode ? 'cursor-pointer' : ''
+                  } ${
                     isHighlighted
                       ? tokens.highlightSentence
                       : useWordKaraoke
                         ? dark
                           ? 'bg-white/5'
                           : 'bg-teal-500/10'
-                        : isSelected
+                        : isSentenceFocusMode && isSelected
                           ? dark
                             ? 'bg-white/10'
                             : 'bg-teal-600/10'
-                          : 'hover:bg-teal-500/10'
+                          : ''
                   } ${isDimmed ? 'opacity-40' : 'opacity-100'}`}
                 >
                   <RenderSentenceText
                     text={sent.text}
                     bionic={settings.bionicReading}
                     punctuationFocus={settings.punctuationFocus}
+                    mirrorLetterAlert={settings.mirrorLetterAlert}
+                    englishSyllables={settings.englishSyllables}
+                    tamilSyllableGrouping={settings.tamilSyllableGrouping}
+                    tamilVowelHighlight={settings.tamilVowelHighlight}
                     karaokeMode={isKaraokeMode}
                     isSpokenSentence={isSpoken}
                     activeWordIndex={isSpoken ? activeSpokenWordIndex : null}
@@ -1233,7 +1626,7 @@ export function ReaderPage({
           >
             {/* Sidebar tabs */}
             <div
-              className={`grid grid-cols-4 gap-1 rounded-2xl border p-1 ${tokens.panelBg} ${tokens.border}`}
+              className={`grid grid-cols-5 gap-1 rounded-2xl border p-1 ${tokens.panelBg} ${tokens.border}`}
               role="tablist"
               aria-label="Customization categories"
             >
@@ -1242,6 +1635,7 @@ export function ReaderPage({
                   ['typography', 'Type'],
                   ['themes', 'Themes'],
                   ['aids', 'Ruler'],
+                  ['tools', 'Tools'],
                   ['speech', 'Speech'],
                 ] as const
               ).map(([id, label]) => (
@@ -1604,19 +1998,372 @@ export function ReaderPage({
                     format={(v) => `${v} sentences`}
                     dark={dark}
                   />
+                  <p className={`text-xs ${tokens.subtext}`}>
+                    Tip: Selecting, copying, or scrolling text will never trigger Read Aloud accidentally. Use Speech controls or Karaoke word clicks when ready to listen.
+                  </p>
+                </div>
+              </div>
+            )}
 
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium">
+            {sidebarTab === 'tools' && (
+              <div className="space-y-4">
+                {/* English Reading Aids & Word Structure */}
+                <section
+                  aria-label="English reading aids"
+                  className={`rounded-2xl border p-4 sm:p-5 space-y-3.5 ${tokens.panelBg} ${tokens.border}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <h2 className={`font-bold text-sm flex items-center gap-1.5 ${tokens.text}`}>
+                      <BookOpenText className="h-4 w-4 text-teal-600" aria-hidden />
+                      English Reading Aids
+                    </h2>
+                  </div>
+
+                  {/* Mirror Letter Alert */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 cursor-pointer text-xs font-semibold">
+                        <input
+                          type="checkbox"
+                          checked={settings.mirrorLetterAlert}
+                          onChange={(e) =>
+                            onSettingsChange({ mirrorLetterAlert: e.target.checked })
+                          }
+                          className="h-4 w-4 accent-teal-600"
+                        />
+                        <span className={tokens.text}>
+                          Mirror Letter Alert (b/d · p/q · m/w)
+                        </span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setShowMirrorHint((v) => !v)}
+                        className={`text-[11px] font-semibold hover:underline ${tokens.subtext}`}
+                      >
+                        {showMirrorHint ? 'Hide key' : 'Color key'}
+                      </button>
+                    </div>
+                    {showMirrorHint && (
+                      <div className={`rounded-xl border p-2.5 text-[11px] space-y-1.5 ${tokens.cardBg} ${tokens.border}`}>
+                        <p className={tokens.subtext}>
+                          Subtle color cues distinguish similar-looking English letter shapes without changing spelling:
+                        </p>
+                        <div className="flex flex-wrap gap-2 font-mono text-xs font-bold">
+                          <span className={getMirrorLetterStyle('b', dark)}>b</span>
+                          <span className={getMirrorLetterStyle('d', dark)}>d</span>
+                          <span className="opacity-40">·</span>
+                          <span className={getMirrorLetterStyle('p', dark)}>p</span>
+                          <span className={getMirrorLetterStyle('q', dark)}>q</span>
+                          <span className="opacity-40">·</span>
+                          <span className={getMirrorLetterStyle('m', dark)}>m</span>
+                          <span className={getMirrorLetterStyle('w', dark)}>w</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* English Syllable Reading */}
+                  <label className="flex items-start gap-2 cursor-pointer text-xs font-semibold">
                     <input
                       type="checkbox"
-                      checked={clickToSpeak}
-                      onChange={(e) => setClickToSpeak(e.target.checked)}
-                      className="h-4 w-4 accent-teal-600"
+                      checked={settings.englishSyllables}
+                      onChange={(e) =>
+                        onSettingsChange({ englishSyllables: e.target.checked })
+                      }
+                      className="h-4 w-4 accent-teal-600 mt-0.5"
                     />
                     <span className={tokens.text}>
-                      Clicking a sentence starts reading aloud from there
+                      English Syllable Reading Mode
+                      <span className={`block font-normal text-[11px] ${tokens.subtext}`}>
+                        Visually separates syllables in multi-syllable English words (English only).
+                      </span>
                     </span>
                   </label>
-                </div>
+
+                  {/* English Prefix / Root / Suffix Explorer */}
+                  <div className="pt-2 border-t border-current/10 space-y-2.5">
+                    <p className={`text-xs font-bold ${tokens.text}`}>
+                      Prefix / Root / Suffix Explorer
+                    </p>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="text"
+                        value={morphWordInput}
+                        onChange={(e) => setMorphWordInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && morphWordInput.trim()) {
+                            e.preventDefault();
+                            void runEnglishMorphology(morphWordInput, false);
+                          }
+                        }}
+                        placeholder="Type English word (e.g. unhappiness)…"
+                        className={`flex-1 min-w-0 rounded-xl border px-2.5 py-1.5 text-xs min-h-[36px] ${tokens.input}`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void runEnglishMorphology(morphWordInput, false)}
+                        disabled={!morphWordInput.trim() || morphLoading}
+                        className={`rounded-xl border px-2.5 py-1.5 text-[11px] font-semibold whitespace-nowrap ${tokens.secondaryBtn}`}
+                      >
+                        Offline
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void runEnglishMorphology(morphWordInput, true)}
+                        disabled={!morphWordInput.trim() || morphLoading}
+                        className="inline-flex items-center gap-1 rounded-xl bg-teal-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-teal-500 disabled:opacity-45 whitespace-nowrap"
+                      >
+                        {morphLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                        AI
+                      </button>
+                    </div>
+
+                    {englishPassageWords.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {englishPassageWords.slice(0, 6).map((item) => (
+                          <button
+                            key={item.word}
+                            type="button"
+                            onClick={() => void runEnglishMorphology(item.word, true)}
+                            className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${tokens.secondaryBtn}`}
+                          >
+                            {item.word}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {morphError && (
+                      <p className="text-[11px] font-medium text-coral-600">{morphError}</p>
+                    )}
+
+                    {morphResult && (
+                      <div className={`rounded-xl border p-3 text-xs space-y-2 ${tokens.cardBg} ${tokens.border}`}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`font-bold ${tokens.text}`}>{morphResult.word}</span>
+                          <span className={`text-[10px] font-semibold ${tokens.subtext}`}>
+                            {morphResult.provider === 'gemini' ? 'Gemini AI' : 'Offline rule-based'}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                          <div className={`rounded-lg border p-1.5 ${tokens.border}`}>
+                            <p className={`font-semibold ${tokens.subtext}`}>Prefix</p>
+                            <p className={`font-bold ${tokens.text}`}>{morphResult.prefix || '—'}</p>
+                            {morphResult.prefixMeaning && (
+                              <p className={tokens.subtext}>{morphResult.prefixMeaning}</p>
+                            )}
+                          </div>
+                          <div className={`rounded-lg border p-1.5 ${tokens.border}`}>
+                            <p className={`font-semibold ${tokens.subtext}`}>Root</p>
+                            <p className={`font-bold ${tokens.text}`}>{morphResult.root || '—'}</p>
+                            {morphResult.rootMeaning && (
+                              <p className={tokens.subtext}>{morphResult.rootMeaning}</p>
+                            )}
+                          </div>
+                          <div className={`rounded-lg border p-1.5 ${tokens.border}`}>
+                            <p className={`font-semibold ${tokens.subtext}`}>Suffix</p>
+                            <p className={`font-bold ${tokens.text}`}>{morphResult.suffix || '—'}</p>
+                            {morphResult.suffixMeaning && (
+                              <p className={tokens.subtext}>{morphResult.suffixMeaning}</p>
+                            )}
+                          </div>
+                        </div>
+                        <p className={tokens.text}>{morphResult.howMeaningChanges}</p>
+                        {(morphResult.uncertain || morphResult.note) && (
+                          <p className={`text-[11px] ${tokens.subtext}`}>{morphResult.note}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </section>
+
+                {/* Dedicated Tamil Reading Tools Section */}
+                <section
+                  aria-label="Tamil Reading Tools"
+                  className={`rounded-2xl border p-4 sm:p-5 space-y-3.5 ${tokens.panelBg} ${tokens.border}`}
+                >
+                  <div>
+                    <h2 className={`font-bold text-sm font-indic ${tokens.text}`}>
+                      Tamil Reading Tools (தமிழ் வாசிப்பு கருவிகள்)
+                    </h2>
+                    <p className={`text-[11px] mt-0.5 ${tokens.subtext}`}>
+                      Grapheme-safe Tamil tools that keep உயிர்மெய் letters &amp; vowel signs intact.
+                    </p>
+                  </div>
+
+                  {/* Tamil Sound / Syllable Grouping */}
+                  <label className="flex items-start gap-2 cursor-pointer text-xs font-semibold font-indic">
+                    <input
+                      type="checkbox"
+                      checked={settings.tamilSyllableGrouping}
+                      onChange={(e) =>
+                        onSettingsChange({ tamilSyllableGrouping: e.target.checked })
+                      }
+                      className="h-4 w-4 accent-teal-600 mt-0.5"
+                    />
+                    <span className={tokens.text}>
+                      Tamil Sound Grouping (தமிழ் அசைப் பிரிப்பு)
+                      <span className={`block font-normal text-[11px] ${tokens.subtext}`}>
+                        Groups intact உயிர் / உயிர்மெய் + ஒற்று (்) units without breaking vowel signs.
+                      </span>
+                    </span>
+                  </label>
+
+                  {/* Tamil Vowel Marker Highlighting */}
+                  <div className="space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <label className="flex items-start gap-2 cursor-pointer text-xs font-semibold font-indic">
+                        <input
+                          type="checkbox"
+                          checked={settings.tamilVowelHighlight}
+                          onChange={(e) =>
+                            onSettingsChange({ tamilVowelHighlight: e.target.checked })
+                          }
+                          className="h-4 w-4 accent-teal-600 mt-0.5"
+                        />
+                        <span className={tokens.text}>
+                          Tamil Vowel Marker Highlight (உயிர்மெய்)
+                          <span className={`block font-normal text-[11px] ${tokens.subtext}`}>
+                            Highlights whole letters carrying ா, ி, ீ, ு, ூ, ெ, ே, ை, ொ, ோ, ௌ.
+                          </span>
+                        </span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setShowTamilVowelLegend((v) => !v)}
+                        className={`text-[11px] font-semibold shrink-0 hover:underline ${tokens.subtext}`}
+                      >
+                        {showTamilVowelLegend ? 'Hide' : 'Legend'}
+                      </button>
+                    </div>
+
+                    {showTamilVowelLegend && (
+                      <div className={`rounded-xl border p-2.5 space-y-1.5 text-[11px] font-indic ${tokens.cardBg} ${tokens.border}`}>
+                        {TAMIL_VOWEL_LEGEND.map((item) => (
+                          <div key={item.nameTa} className="flex items-center justify-between gap-2">
+                            <span className={`font-bold text-xs ${getTamilVowelStyle(item.kind, dark)}`}>
+                              {item.sample}
+                            </span>
+                            <span className={tokens.subtext}>
+                              {item.nameTa} ({item.markers})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Tamil Compound Word Splitter (சந்தி பிரித்தல்) */}
+                  <div className="pt-2 border-t border-current/10 space-y-2.5">
+                    <p className={`text-xs font-bold font-indic ${tokens.text}`}>
+                      Tamil Compound Word Splitter (சந்தி பிரித்தல்)
+                    </p>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="text"
+                        value={sandhiWordInput}
+                        onChange={(e) => setSandhiWordInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && sandhiWordInput.trim()) {
+                            e.preventDefault();
+                            void runTamilSandhi(sandhiWordInput, true);
+                          }
+                        }}
+                        placeholder="தமிழ் சொல் (எ.கா. பள்ளிக்கூடம்)…"
+                        className={`flex-1 min-w-0 rounded-xl border px-2.5 py-1.5 text-xs min-h-[36px] font-indic ${tokens.input}`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void runTamilSandhi(sandhiWordInput, false)}
+                        disabled={!sandhiWordInput.trim() || sandhiLoading}
+                        className={`rounded-xl border px-2.5 py-1.5 text-[11px] font-semibold whitespace-nowrap ${tokens.secondaryBtn}`}
+                      >
+                        Offline
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void runTamilSandhi(sandhiWordInput, true)}
+                        disabled={!sandhiWordInput.trim() || sandhiLoading}
+                        className="inline-flex items-center gap-1 rounded-xl bg-teal-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-teal-500 disabled:opacity-45 whitespace-nowrap"
+                      >
+                        {sandhiLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                        AI
+                      </button>
+                    </div>
+
+                    {tamilPassageWords.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {tamilPassageWords.slice(0, 6).map((item) => (
+                          <button
+                            key={item.word}
+                            type="button"
+                            onClick={() => void runTamilSandhi(item.word, true)}
+                            className={`rounded-md border px-2 py-0.5 text-[11px] font-medium font-indic ${tokens.secondaryBtn}`}
+                          >
+                            {item.word}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {sandhiError && (
+                      <p className="text-[11px] font-medium text-coral-600 font-indic">
+                        {sandhiError}
+                      </p>
+                    )}
+
+                    {sandhiResult && (
+                      <div className={`rounded-xl border p-3 text-xs space-y-2 font-indic ${tokens.cardBg} ${tokens.border}`}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`font-bold text-sm ${tokens.text}`}>{sandhiResult.word}</span>
+                          <span className={`text-[10px] font-semibold ${tokens.subtext}`}>
+                            {sandhiResult.provider === 'gemini' ? 'Gemini AI' : 'அடிப்படை (Offline)'}
+                          </span>
+                        </div>
+
+                        {sandhiResult.components.length > 0 && (
+                          <div className="space-y-1">
+                            {sandhiResult.components.map((c, idx) => (
+                              <div
+                                key={idx}
+                                className={`rounded-lg border px-2.5 py-1.5 flex items-start justify-between gap-2 ${tokens.border}`}
+                              >
+                                <div>
+                                  <span className={`font-bold ${tokens.text}`}>{c.part}</span>
+                                  <span className={`ml-1.5 text-[10px] ${tokens.subtext}`}>
+                                    ({c.role})
+                                  </span>
+                                </div>
+                                <span className={`text-[11px] text-right ${tokens.subtext}`}>
+                                  {c.meaningTa}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="flex flex-wrap gap-3 text-[11px]">
+                          {sandhiResult.root && (
+                            <span className={tokens.text}>
+                              <strong>வேர்:</strong> {sandhiResult.root}
+                            </span>
+                          )}
+                          {sandhiResult.suffixes.length > 0 && (
+                            <span className={tokens.text}>
+                              <strong>விகுதி:</strong> {sandhiResult.suffixes.join(', ')}
+                            </span>
+                          )}
+                        </div>
+
+                        <p className={tokens.text}>{sandhiResult.overallMeaningTa}</p>
+
+                        {(sandhiResult.uncertain || sandhiResult.note) && (
+                          <p className={`text-[11px] ${tokens.subtext}`}>{sandhiResult.note}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </section>
               </div>
             )}
 

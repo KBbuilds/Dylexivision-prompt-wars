@@ -322,6 +322,62 @@ export function SettingsPage({
             <label className="inline-flex items-center gap-2.5 cursor-pointer min-h-[40px]">
               <input
                 type="checkbox"
+                checked={settings.mirrorLetterAlert}
+                onChange={(e) =>
+                  onSettingsChange({ mirrorLetterAlert: e.target.checked })
+                }
+                className="h-4 w-4 accent-teal-600"
+              />
+              <span className={`text-sm font-medium ${tokens.text}`}>
+                Mirror Letter Alert (b/d, p/q, m/w)
+              </span>
+            </label>
+
+            <label className="inline-flex items-center gap-2.5 cursor-pointer min-h-[40px]">
+              <input
+                type="checkbox"
+                checked={settings.englishSyllables}
+                onChange={(e) =>
+                  onSettingsChange({ englishSyllables: e.target.checked })
+                }
+                className="h-4 w-4 accent-teal-600"
+              />
+              <span className={`text-sm font-medium ${tokens.text}`}>
+                English Syllable Reading divisions
+              </span>
+            </label>
+
+            <label className="inline-flex items-center gap-2.5 cursor-pointer min-h-[40px]">
+              <input
+                type="checkbox"
+                checked={settings.tamilSyllableGrouping}
+                onChange={(e) =>
+                  onSettingsChange({ tamilSyllableGrouping: e.target.checked })
+                }
+                className="h-4 w-4 accent-teal-600"
+              />
+              <span className={`text-sm font-medium ${tokens.text}`}>
+                Tamil Sound Grouping (தமிழ் அசைப் பிரிப்பு)
+              </span>
+            </label>
+
+            <label className="inline-flex items-center gap-2.5 cursor-pointer min-h-[40px]">
+              <input
+                type="checkbox"
+                checked={settings.tamilVowelHighlight}
+                onChange={(e) =>
+                  onSettingsChange({ tamilVowelHighlight: e.target.checked })
+                }
+                className="h-4 w-4 accent-teal-600"
+              />
+              <span className={`text-sm font-medium ${tokens.text}`}>
+                Tamil Vowel Marker Highlighting (உயிர்மெய் குறியீடுகள்)
+              </span>
+            </label>
+
+            <label className="inline-flex items-center gap-2.5 cursor-pointer min-h-[40px]">
+              <input
+                type="checkbox"
                 checked={settings.rulerEnabled}
                 onChange={(e) =>
                   onSettingsChange({ rulerEnabled: e.target.checked })

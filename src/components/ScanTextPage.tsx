@@ -5,11 +5,13 @@ import {
   type ChangeEvent,
   type ClipboardEvent,
 } from 'react';
-import { createWorker, OEM, PSM } from 'tesseract.js';
+import type { Worker } from 'tesseract.js';
 import {
+  AlertTriangle,
   ArrowRight,
   BookmarkCheck,
   Camera,
+  CheckCircle2,
   FileImage,
   Loader2,
   RotateCcw,
@@ -26,6 +28,7 @@ interface ScanTextPageProps {
 }
 
 type OcrLanguageCode = 'eng' | 'tam' | 'tam+eng';
+type OfflineAssetStatus = 'not-loaded' | 'loading' | 'ready' | 'unavailable';
 
 const WORKING_OCR_LANGUAGES: Array<{
   code: OcrLanguageCode;
@@ -48,11 +51,73 @@ const UPCOMING_OCR_LANGUAGES = [
   'Telugu',
 ] as const;
 
+// Module-level worker cache so language packs & WASM engines are reused across uploads
+const cachedTesseractWorkers = new Map<OcrLanguageCode, Promise<Worker>>();
+const loadedOfflinePacks = new Set<OcrLanguageCode>();
+
 /**
- * Gently upscale small screenshots and normalize contrast into crisp grayscale
- * so thin Tamil vowel hooks and pulli dots remain sharp for Tesseract LSTM.
+ * Fast client-side image downscaling for Vision AI without slow grayscale pixel loops.
+ * Preserves color and ink nuances needed for handwritten + printed English/Tamil OCR.
  */
-async function prepareImageForOcr(blob: File | Blob): Promise<File | Blob> {
+async function prepareImagePayloadForVision(
+  blob: File | Blob,
+): Promise<{ base64: string; mimeType: string }> {
+  const fallbackRead = async (b: Blob) => {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ''));
+      reader.onerror = () => reject(new Error('Failed to read image file.'));
+      reader.readAsDataURL(b);
+    });
+    const mimeMatch = dataUrl.match(/^data:(image\/[a-zA-Z+]+);base64,/);
+    return {
+      base64: dataUrl,
+      mimeType: mimeMatch?.[1] || b.type || 'image/jpeg',
+    };
+  };
+
+  if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') {
+    return fallbackRead(blob);
+  }
+
+  try {
+    const bitmap = await createImageBitmap(blob);
+    const { width, height } = bitmap;
+    const maxDim = Math.max(width, height);
+    const scale = maxDim > 1600 ? 1600 / maxDim : 1;
+
+    const targetW = Math.max(1, Math.round(width * scale));
+    const targetH = Math.max(1, Math.round(height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      bitmap.close();
+      return fallbackRead(blob);
+    }
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, targetW, targetH);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+    bitmap.close();
+
+    const outputMime = blob.type === 'image/png' && blob.size < 900_000 ? 'image/png' : 'image/jpeg';
+    const quality = outputMime === 'image/jpeg' ? 0.9 : 1.0;
+    const dataUrl = canvas.toDataURL(outputMime, quality);
+    return { base64: dataUrl, mimeType: outputMime };
+  } catch {
+    return fallbackRead(blob);
+  }
+}
+
+/**
+ * Lightweight grayscale contrast prep used only when local Tesseract fallback runs.
+ */
+async function prepareImageForTesseract(blob: File | Blob): Promise<File | Blob> {
   if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') {
     return blob;
   }
@@ -61,7 +126,12 @@ async function prepareImageForOcr(blob: File | Blob): Promise<File | Blob> {
     const bitmap = await createImageBitmap(blob);
     const { width, height } = bitmap;
     const maxDim = Math.max(width, height);
-    const scale = maxDim < 1400 ? Math.min(2, 1600 / Math.max(1, maxDim)) : maxDim > 2400 ? 2400 / maxDim : 1;
+    const scale =
+      maxDim < 1200
+        ? Math.min(2, 1400 / Math.max(1, maxDim))
+        : maxDim > 2000
+          ? 2000 / maxDim
+          : 1;
 
     const targetW = Math.max(1, Math.round(width * scale));
     const targetH = Math.max(1, Math.round(height * scale));
@@ -75,44 +145,12 @@ async function prepareImageForOcr(blob: File | Blob): Promise<File | Blob> {
       return blob;
     }
 
-    // White background prevents transparent PNGs from turning black during JPEG/OCR
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, targetW, targetH);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(bitmap, 0, 0, targetW, targetH);
     bitmap.close();
-
-    // Subtle grayscale contrast stretch preserving antialiased edges
-    const imageData = ctx.getImageData(0, 0, targetW, targetH);
-    const data = imageData.data;
-    let minLum = 255;
-    let maxLum = 0;
-
-    for (let i = 0; i < data.length; i += 4) {
-      const lum = Math.round(
-        0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2],
-      );
-      if (lum < minLum) minLum = lum;
-      if (lum > maxLum) maxLum = lum;
-      data[i] = lum;
-      data[i + 1] = lum;
-      data[i + 2] = lum;
-    }
-
-    const range = maxLum - minLum;
-    if (range > 25 && range < 210) {
-      for (let i = 0; i < data.length; i += 4) {
-        const stretched = Math.min(
-          255,
-          Math.max(0, Math.round(((data[i] - minLum) / range) * 255)),
-        );
-        data[i] = stretched;
-        data[i + 1] = stretched;
-        data[i + 2] = stretched;
-      }
-    }
-    ctx.putImageData(imageData, 0, 0);
 
     const processed = await new Promise<Blob | null>((resolve) =>
       canvas.toBlob(resolve, 'image/png', 1.0),
@@ -125,7 +163,7 @@ async function prepareImageForOcr(blob: File | Blob): Promise<File | Blob> {
 
 function cleanRecognizedText(raw: string): string {
   return raw
-    .replace(/\u200c/g, '') // remove stray ZWNJ artifacts emitted by Tesseract tam
+    .replace(/\u200c/g, '')
     .replace(/\r\n/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -141,11 +179,20 @@ export function ScanTextPage({
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | Blob | null>(null);
   const [extractedText, setExtractedText] = useState('');
-  const [progress, setProgress] = useState(0);
+  const [progress, setProgress] = useState<number | null>(null);
   const [statusLabel, setStatusLabel] = useState<string>('');
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [mismatchHint, setMismatchHint] = useState<string | null>(null);
+  const [scanMeta, setScanMeta] = useState<{
+    engine: string;
+    detectedLanguage?: string;
+    writingStyle?: string;
+  } | null>(null);
+  const [uncertaintyWarning, setUncertaintyWarning] = useState<string | null>(null);
+  const [offlineAssetStatus, setOfflineAssetStatus] =
+    useState<OfflineAssetStatus>(
+      loadedOfflinePacks.has('eng') ? 'ready' : 'not-loaded',
+    );
   const [savedFeedback, setSavedFeedback] = useState<string | null>(null);
 
   // Optional live webcam capture
@@ -154,6 +201,12 @@ export function ScanTextPage({
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    setOfflineAssetStatus(
+      loadedOfflinePacks.has(ocrLang) ? 'ready' : 'not-loaded',
+    );
+  }, [ocrLang]);
 
   useEffect(() => {
     return () => {
@@ -166,8 +219,11 @@ export function ScanTextPage({
 
   const loadImageBlob = (blob: File | Blob) => {
     setError(null);
-    setMismatchHint(null);
+    setUncertaintyWarning(null);
+    setScanMeta(null);
     setSavedFeedback(null);
+    setStatusLabel('');
+    setProgress(null);
     if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
     const nextUrl = URL.createObjectURL(blob);
     setImagePreviewUrl(nextUrl);
@@ -246,9 +302,106 @@ export function ScanTextPage({
           stopCamera();
         }
       },
-      'image/png',
-      0.95,
+      'image/jpeg',
+      0.92,
     );
+  };
+
+  const getOrCreateTesseractWorker = async (
+    lang: OcrLanguageCode,
+    onLogger: (status: string, p?: number) => void,
+  ): Promise<Worker> => {
+    const existing = cachedTesseractWorkers.get(lang);
+    if (existing) {
+      return existing;
+    }
+
+    setOfflineAssetStatus('loading');
+    const createPromise = (async () => {
+      const { createWorker, OEM, PSM } = await import('tesseract.js');
+      const worker = await createWorker(lang, OEM.LSTM_ONLY, {
+        langPath: '/tessdata',
+        cacheMethod: 'write',
+        logger: (msg) => {
+          onLogger(
+            msg.status ?? '',
+            typeof msg.progress === 'number' ? msg.progress : undefined,
+          );
+        },
+        errorHandler: () => {
+          // Handled cleanly on rejection
+        },
+      });
+      await worker.setParameters({
+        tessedit_pageseg_mode: PSM.AUTO,
+        preserve_interword_spaces: '1',
+        user_defined_dpi: '300',
+      });
+      loadedOfflinePacks.add(lang);
+      setOfflineAssetStatus('ready');
+      return worker;
+    })();
+
+    cachedTesseractWorkers.set(lang, createPromise);
+    try {
+      return await createPromise;
+    } catch (err) {
+      cachedTesseractWorkers.delete(lang);
+      setOfflineAssetStatus('unavailable');
+      throw err;
+    }
+  };
+
+  const runLocalTesseractFallback = async (
+    blob: File | Blob,
+    reasonNotice?: string,
+  ) => {
+    const activeMeta =
+      WORKING_OCR_LANGUAGES.find((l) => l.code === ocrLang) ??
+      WORKING_OCR_LANGUAGES[0];
+
+    setStatusLabel(
+      loadedOfflinePacks.has(ocrLang)
+        ? `Using cached local ${activeMeta.modelName} OCR engine…`
+        : `Loading local ${activeMeta.modelName} offline pack (cached after first use)…`,
+    );
+    setProgress(null);
+
+    const worker = await getOrCreateTesseractWorker(ocrLang, (msgStatus, p) => {
+      if (msgStatus === 'recognizing text') {
+        setStatusLabel(`Scanning printed ${activeMeta.label} text locally…`);
+      } else if (msgStatus) {
+        setStatusLabel(`Preparing ${activeMeta.modelName} (${msgStatus})…`);
+      }
+      if (typeof p === 'number') {
+        setProgress(Math.round(p * 100));
+      }
+    });
+
+    const preparedImage = await prepareImageForTesseract(blob);
+    const result = await worker.recognize(preparedImage);
+    const cleaned = cleanRecognizedText(result.data.text);
+
+    if (!cleaned) {
+      setError(
+        `No readable printed ${activeMeta.label} text was found locally. Try a clearer image or ensure Vision AI is online for handwriting.`,
+      );
+      return;
+    }
+
+    setExtractedText(cleaned);
+    setProgress(100);
+    setStatusLabel('Local printed OCR complete');
+    setScanMeta({
+      engine: `Local Printed OCR (${activeMeta.modelName})`,
+      detectedLanguage: activeMeta.label,
+      writingStyle: 'Printed (Local fallback)',
+    });
+    if (reasonNotice) {
+      setUncertaintyWarning(
+        `${reasonNotice} Local browser OCR works best for printed text; review handwritten lines carefully before opening in Studio.`,
+      );
+    }
   };
 
   const runOcr = async () => {
@@ -257,134 +410,101 @@ export function ScanTextPage({
       return;
     }
 
-    const activeMeta =
-      WORKING_OCR_LANGUAGES.find((l) => l.code === ocrLang) ??
-      WORKING_OCR_LANGUAGES[0];
-
     setScanning(true);
     setError(null);
-    setMismatchHint(null);
-    setProgress(5);
-    setStatusLabel(`Loading ${activeMeta.modelName} OCR model…`);
-
-    let worker: Awaited<ReturnType<typeof createWorker>> | null = null;
-    let workerInitError: string | null = null;
-    let timeoutId: number | null = null;
-    let rejectOnWorkerError: ((reason: Error) => void) | null = null;
+    setUncertaintyWarning(null);
+    setScanMeta(null);
+    setProgress(null);
+    setStatusLabel('Preparing image and reading printed or handwritten text…');
 
     try {
-      const workerErrorPromise = new Promise<never>((_, reject) => {
-        rejectOnWorkerError = reject;
-      });
+      const payload = await prepareImagePayloadForVision(selectedFile);
+      const controller = new AbortController();
+      const abortTimer = window.setTimeout(() => controller.abort(), 45000);
 
-      const workerPromise = createWorker(ocrLang, OEM.LSTM_ONLY, {
-        logger: (msg) => {
-          if (msg.status) {
-            if (msg.status === 'recognizing text') {
-              setStatusLabel(`Recognizing ${activeMeta.label} text…`);
-            } else if (msg.status.includes('loading language')) {
-              setStatusLabel(`Downloading ${activeMeta.modelName} traineddata…`);
-            } else {
-              setStatusLabel(`Preparing ${activeMeta.label} OCR (${msg.status})…`);
-            }
-          }
-          if (typeof msg.progress === 'number') {
-            setProgress(Math.max(5, Math.round(msg.progress * 100)));
-          }
-        },
-        errorHandler: (err) => {
-          const message =
-            err instanceof Error ? err.message : String(err ?? 'Worker error');
-          workerInitError = message;
-          rejectOnWorkerError?.(new Error(message));
-        },
-      });
-      void workerPromise.catch(() => {});
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = window.setTimeout(
-          () =>
-            reject(
-              new Error(
-                `Timed out while loading the ${activeMeta.modelName} model.`,
-              ),
-            ),
-          35000,
-        );
-      });
-
-      worker = await Promise.race([
-        workerPromise,
-        workerErrorPromise,
-        timeoutPromise,
-      ]);
-
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-        timeoutId = null;
+      let visionResponse: Response;
+      try {
+        visionResponse = await fetch('/api/ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            imageBase64: payload.base64,
+            mimeType: payload.mimeType,
+            languageHint: ocrLang,
+          }),
+        });
+      } finally {
+        window.clearTimeout(abortTimer);
       }
 
-      if (workerInitError) {
-        throw new Error(workerInitError);
+      type VisionOcrResponse = {
+        error?: string;
+        message?: string;
+        text?: string;
+        detectedLanguage?: string;
+        writingStyle?: string;
+        uncertain?: boolean;
+        uncertaintyNote?: string;
+      };
+      const raw = await visionResponse.text();
+      let data: VisionOcrResponse | null = null;
+
+      try {
+        data = JSON.parse(raw) as VisionOcrResponse;
+      } catch {
+        data = null;
       }
 
-      await worker.setParameters({
-        tessedit_pageseg_mode: PSM.AUTO,
-        preserve_interword_spaces: '1',
-        user_defined_dpi: '300',
-      });
-
-      const preparedImage = await prepareImageForOcr(selectedFile);
-      const result = await worker.recognize(preparedImage);
-
-      if (workerInitError) {
-        throw new Error(workerInitError);
-      }
-
-      const cleaned = cleanRecognizedText(result.data.text);
-
-      if (!cleaned) {
-        setError(
-          `No readable ${activeMeta.label} text was detected in this image. Try a clearer, brighter photo with straight horizontal text.`,
-        );
-      } else {
-        setExtractedText(cleaned);
-        setProgress(100);
-        setStatusLabel(`${activeMeta.label} extraction complete`);
-
-        if (ocrLang === 'eng') {
-          const lettersOnly = cleaned.replace(/[^A-Za-z]/g, '').length;
-          if (cleaned.length > 8 && lettersOnly / cleaned.length < 0.35) {
-            setMismatchHint(
-              'The extracted text looks unusual for English. If this image has Tamil script, switch OCR language to தமிழ் (Tamil) or Tamil + English above and scan again.',
-            );
-          }
+      if (visionResponse.ok && data) {
+        const cleaned = cleanRecognizedText(data.text ?? '');
+        if (!cleaned) {
+          setError(
+            data.uncertaintyNote ||
+              'No readable English or Tamil text was detected in this image. Try brighter lighting or a closer photo.',
+          );
+          setStatusLabel('');
+          return;
         }
+
+        setExtractedText(cleaned);
+        setStatusLabel('Text extraction complete');
+        setScanMeta({
+          engine: 'Vision AI OCR',
+          detectedLanguage: data.detectedLanguage,
+          writingStyle: data.writingStyle,
+        });
+        if (data.uncertain || data.uncertaintyNote) {
+          setUncertaintyWarning(
+            data.uncertaintyNote ||
+              'Some handwritten or low-contrast words may be uncertain. Please review and edit the text on the right if needed.',
+          );
+        }
+        return;
       }
+
+      // If Vision AI is unavailable or fails, automatically fall back to local printed OCR
+      const fallbackMsg =
+        data?.message ||
+        `Vision AI OCR is temporarily unavailable (HTTP ${visionResponse.status}).`;
+      await runLocalTesseractFallback(selectedFile, fallbackMsg);
     } catch (err) {
-      const detail =
-        err instanceof Error
-          ? err.message
-          : workerInitError || 'Could not extract text from the selected image.';
-      if (ocrLang.includes('tam')) {
-        setError(
-          `Tamil OCR failed (${detail}). English fallback was not used. Check your network connection so the Tamil model (tam) can download, or try a sharper image.`,
+      // Network/timeout on Vision AI -> try cached local printed fallback
+      try {
+        await runLocalTesseractFallback(
+          selectedFile,
+          err instanceof Error && err.name === 'AbortError'
+            ? 'Vision AI request timed out; used local printed OCR instead.'
+            : 'Could not reach Vision AI; used local printed OCR instead.',
         );
-      } else {
+      } catch (localErr) {
+        const detail =
+          localErr instanceof Error
+            ? localErr.message
+            : 'Could not extract text from this image.';
         setError(`OCR failed: ${detail}`);
       }
     } finally {
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-        timeoutId = null;
-      }
-      if (worker) {
-        try {
-          await worker.terminate();
-        } catch {
-          // ignore cleanup failure
-        }
-      }
       setScanning(false);
     }
   };
@@ -394,10 +514,11 @@ export function ScanTextPage({
     setImagePreviewUrl(null);
     setSelectedFile(null);
     setExtractedText('');
-    setProgress(0);
+    setProgress(null);
     setStatusLabel('');
     setError(null);
-    setMismatchHint(null);
+    setUncertaintyWarning(null);
+    setScanMeta(null);
     setSavedFeedback(null);
     stopCamera();
   };
@@ -410,24 +531,38 @@ export function ScanTextPage({
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div>
           <h1 className={`font-display text-2xl sm:text-3xl font-bold ${tokens.text}`}>
-            Scan Text (Client-Side OCR)
+            Scan Text (Printed &amp; Handwritten OCR)
           </h1>
           <p className={`mt-1 text-sm sm:text-base ${tokens.subtext}`}>
-            Upload a screenshot, photograph a page, paste from clipboard
-            (Ctrl+V), or use your camera. Runs privately in your browser with
-            Tesseract.js.
+            Upload a photo, screenshot, or handwritten note, paste from
+            clipboard (Ctrl+V), or use your camera. Automatically detects
+            printed and handwritten English, Tamil, or mixed pages.
           </p>
         </div>
 
-        {/* Compact Language Selector + Disabled Upcoming Languages */}
+        {/* Compact Language Hint Selector + Offline Cache Readiness */}
         <div className="space-y-2 shrink-0">
           <div>
-            <span className={`block text-xs font-semibold mb-1.5 ${tokens.subtext}`}>
-              OCR language
-            </span>
+            <div className="flex items-center justify-between gap-3 mb-1.5">
+              <span className={`text-xs font-semibold ${tokens.subtext}`}>
+                Document hint (auto-detects script)
+              </span>
+              <span className={`text-[11px] font-medium ${tokens.subtext}`}>
+                Offline pack:{' '}
+                <strong className={tokens.text}>
+                  {offlineAssetStatus === 'ready'
+                    ? 'Ready'
+                    : offlineAssetStatus === 'loading'
+                      ? 'Loading…'
+                      : offlineAssetStatus === 'unavailable'
+                        ? 'Unavailable'
+                        : 'On demand'}
+                </strong>
+              </span>
+            </div>
             <div
               role="radiogroup"
-              aria-label="OCR document language"
+              aria-label="OCR document language hint"
               className={`inline-flex flex-wrap gap-1 rounded-xl border p-1 ${tokens.panelBg} ${tokens.border}`}
             >
               {WORKING_OCR_LANGUAGES.map((lang) => {
@@ -442,7 +577,6 @@ export function ScanTextPage({
                     onClick={() => {
                       setOcrLang(lang.code);
                       setError(null);
-                      setMismatchHint(null);
                     }}
                     className={`rounded-lg px-3 py-1.5 min-h-[36px] text-xs font-semibold transition-colors whitespace-nowrap font-indic disabled:opacity-50 ${
                       selected
@@ -587,10 +721,10 @@ export function ScanTextPage({
                 aria-hidden
               />
               <p className={`text-sm font-semibold ${tokens.text}`}>
-                Drop an image here, upload a file, or paste a screenshot
+                Drop a printed or handwritten image here, upload, or paste
               </p>
               <p className={`text-xs ${tokens.subtext}`}>
-                Works best with clear lighting and horizontal text lines.
+                Supports English, தமிழ் (Tamil), and mixed Tamil + English pages.
               </p>
             </div>
           )}
@@ -611,10 +745,10 @@ export function ScanTextPage({
                 {scanning ? (
                   <>
                     <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
-                    Scanning ({progress}%)…
+                    {progress !== null ? `Scanning (${progress}%)…` : 'Reading image…'}
                   </>
                 ) : (
-                  `Extract ${WORKING_OCR_LANGUAGES.find((l) => l.code === ocrLang)?.label ?? ''} text`
+                  'Extract text from image'
                 )}
               </button>
             </div>
@@ -624,20 +758,49 @@ export function ScanTextPage({
             <div className="space-y-1.5" aria-live="polite">
               <div className="flex justify-between text-xs tabular-nums">
                 <span className={tokens.subtext}>{statusLabel}</span>
-                <span className={tokens.subtext}>{progress}%</span>
+                {progress !== null && (
+                  <span className={tokens.subtext}>{progress}%</span>
+                )}
               </div>
-              <div
-                className={`h-2 rounded-full overflow-hidden ${tokens.dark ? 'bg-[#0F1B2E]' : 'bg-cream-200'}`}
-                role="progressbar"
-                aria-valuenow={progress}
-                aria-valuemin={0}
-                aria-valuemax={100}
-              >
+              {progress !== null && (
                 <div
-                  className="h-full bg-teal-600 transition-[width] duration-150"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
+                  className={`h-2 rounded-full overflow-hidden ${tokens.dark ? 'bg-[#0F1B2E]' : 'bg-cream-200'}`}
+                  role="progressbar"
+                  aria-valuenow={progress}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div
+                    className="h-full bg-teal-600 transition-[width] duration-150"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {scanMeta && !scanning && (
+            <div
+              className={`rounded-xl border px-3.5 py-2.5 text-xs flex flex-wrap items-center gap-2 ${tokens.cardBg} ${tokens.border}`}
+            >
+              <CheckCircle2 className="h-4 w-4 text-teal-600 shrink-0" aria-hidden />
+              <span className={`font-semibold ${tokens.text}`}>{scanMeta.engine}</span>
+              {scanMeta.detectedLanguage && (
+                <span className={tokens.subtext}>· {scanMeta.detectedLanguage}</span>
+              )}
+              {scanMeta.writingStyle && (
+                <span className={tokens.subtext}>· {scanMeta.writingStyle}</span>
+              )}
+            </div>
+          )}
+
+          {uncertaintyWarning && (
+            <div
+              role="status"
+              className="rounded-xl border border-amber-400/50 bg-amber-400/10 px-4 py-3 text-xs font-medium flex items-start gap-2.5"
+            >
+              <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" aria-hidden />
+              <span className={tokens.text}>{uncertaintyWarning}</span>
             </div>
           )}
 
@@ -647,15 +810,6 @@ export function ScanTextPage({
               className="rounded-xl border border-coral-500/40 bg-coral-500/10 px-4 py-3 text-sm font-medium text-coral-600"
             >
               {error}
-            </div>
-          )}
-
-          {mismatchHint && !error && (
-            <div
-              role="status"
-              className={`rounded-xl border px-4 py-3 text-xs font-medium ${tokens.border} ${tokens.subtext}`}
-            >
-              {mismatchHint}
             </div>
           )}
         </section>
@@ -680,7 +834,7 @@ export function ScanTextPage({
             <textarea
               value={extractedText}
               onChange={(e) => setExtractedText(e.target.value)}
-              placeholder="Extracted text will appear here after scanning. Select தமிழ் (Tamil) above before scanning Tamil pages."
+              placeholder="Extracted printed or handwritten text (English & தமிழ்) will appear here. You can edit any words before sending to Reading Studio."
               rows={12}
               aria-label="Editable OCR extracted text"
               className={`w-full flex-1 resize-y rounded-2xl border px-4 py-3.5 text-base leading-relaxed font-indic focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20 ${tokens.input}`}

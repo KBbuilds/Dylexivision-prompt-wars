@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowRight,
   BookMarked,
+  Check,
   CheckCircle2,
+  Copy,
   Languages,
   Loader2,
   Sparkles,
@@ -15,6 +17,7 @@ import { containsTamilScript } from '@/lib/languages';
 import {
   chunkParagraphsOffline,
   detectDifficultWords,
+  detectLongTamilWords,
   easierEnglishOffline,
   extractFallbackWord,
   extractKeyPointsOffline,
@@ -72,7 +75,7 @@ const TOOL_LIST: Array<{ id: ToolId; label: string; offlineSupport: string }> = 
   { id: 'simplify', label: 'Simplify Text', offlineSupport: 'Offline + AI' },
   {
     id: 'easier-english',
-    label: 'Easier English',
+    label: 'Easier English / Easy Tamil',
     offlineSupport: 'AI / Rule-based',
   },
   {
@@ -135,8 +138,22 @@ export function AiToolsPage({
   const [dictResult, setDictResult] = useState<DictionaryResult | null>(null);
   const [dictSource, setDictSource] = useState<string>('');
   const [dictError, setDictError] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const difficultWords = useMemo(() => detectDifficultWords(text), [text]);
+  const longTamilWords = useMemo(() => detectLongTamilWords(text), [text]);
+
+  const handleCopy = async (content: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedId(id);
+      window.setTimeout(() => {
+        setCopiedId((prev) => (prev === id ? null : prev));
+      }, 2000);
+    } catch {
+      // Clipboard blocked in iframe fallback: no crash
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -165,6 +182,7 @@ export function AiToolsPage({
     setAiQuestions([]);
     setRevealedAnswers({});
     setOfflineRecall([]);
+    setCopiedId(null);
     if (clearDictionary) {
       setDictResult(null);
       setDictSource('');
@@ -207,6 +225,17 @@ export function AiToolsPage({
     }
   };
 
+  const lookupWordOrTamil = async (wordToFind: string) => {
+    const clean = wordToFind.trim();
+    if (!clean) return;
+    if (containsTamilScript(clean)) {
+      setWordInput(clean);
+      await runAiTool(selectedTool === 'synonyms' ? 'synonyms' : 'explain-words', clean);
+      return;
+    }
+    await lookupDictionaryWord(clean);
+  };
+
   const runOfflineTool = (tool: ToolId) => {
     const isWordTool = tool === 'explain-words' || tool === 'synonyms';
     clearOutputs(!isWordTool);
@@ -217,7 +246,13 @@ export function AiToolsPage({
 
     switch (tool) {
       case 'simplify': {
-        const { simplified, changes } = simplifyTextOffline(text);
+        const { simplified, changes, changed } = simplifyTextOffline(text);
+        if (!changed) {
+          setAiNotice(
+            'Offline rules did not find formal substitutions or long compound sentences to shorten in this passage. Use Gemini AI for deeper rewriting.',
+          );
+          return;
+        }
         setResultText(simplified);
         setWordChanges(changes);
         setResultKind('offline');
@@ -225,29 +260,54 @@ export function AiToolsPage({
         break;
       }
       case 'easier-english': {
-        const { simplified, changes } = easierEnglishOffline(text);
+        const { simplified, changes, changed } = easierEnglishOffline(text);
+        if (!changed) {
+          setAiNotice(
+            containsTamilScript(text)
+              ? 'ஆஃப்லைன் விதிகள் மாற்ற வேண்டிய கடினச் சொற்களைக் கண்டறியவில்லை. முழு எளிய தமிழ் (Easy Tamil) மாற்றத்திற்கு Gemini AI-ஐப் பயன்படுத்தவும்.'
+              : 'Offline rules did not find formal phrases or long sentences to rewrite. Use Gemini AI for full plain-language rewriting.',
+          );
+          return;
+        }
         setResultText(simplified);
         setWordChanges(changes);
         setResultKind('offline');
         setResultSource(
-          'Offline Rule-Based Plain-English Helper (for full AI rewriting, use Gemini AI)',
+          containsTamilScript(text)
+            ? 'Offline Rule-Based Easy Tamil Helper (for full AI rewriting, use Gemini AI)'
+            : 'Offline Rule-Based Plain-English Helper (for full AI rewriting, use Gemini AI)',
         );
         break;
       }
       case 'paragraph-chunking': {
-        setResultText(chunkParagraphsOffline(text));
+        const chunked = chunkParagraphsOffline(text);
+        if (!chunked.trim()) {
+          setToolError('Passage could not be split into chunks.');
+          return;
+        }
+        setResultText(chunked);
         setResultKind('offline');
         setResultSource('Offline Sentence-Boundary Paragraph Chunker');
         break;
       }
       case 'key-points': {
-        setKeyPoints(extractKeyPointsOffline(text, 5));
+        const pts = extractKeyPointsOffline(text, 5);
+        if (pts.length === 0) {
+          setToolError('Passage has no complete sentences to extract key points from.');
+          return;
+        }
+        setKeyPoints(pts);
         setResultKind('offline');
         setResultSource('Offline Extractive Key-Sentence Ranking');
         break;
       }
       case 'summarize': {
-        setResultText(summarizeOffline(text));
+        const summary = summarizeOffline(text);
+        if (!summary.trim()) {
+          setToolError('Passage is too short for offline extractive summary.');
+          return;
+        }
+        setResultText(summary);
         setResultKind('offline');
         setResultSource('Offline Extractive Summary');
         break;
@@ -269,6 +329,12 @@ export function AiToolsPage({
       }
       case 'explain-words':
       case 'synonyms': {
+        if (wordInput.trim() && containsTamilScript(wordInput)) {
+          setToolError(
+            'Free offline dictionary lookup supports English words only. Click "Run with Gemini AI" for Tamil word explanations and synonyms.',
+          );
+          return;
+        }
         const candidateWord =
           wordInput.trim() ||
           difficultWords[0]?.word ||
@@ -277,11 +343,11 @@ export function AiToolsPage({
           void lookupDictionaryWord(candidateWord);
         } else if (containsTamilScript(text)) {
           setToolError(
-            'Free offline dictionary lookup supports English words. Type an English word above, or use the English ↔ Tamil tab or Gemini AI.',
+            'Free offline dictionary lookup only covers English words. Click "Run with Gemini AI" above to get Tamil word explanations and synonyms.',
           );
         } else {
           setToolError(
-            'No English words were detected in the passage. Type any word above to look it up.',
+            'No English words were detected in the passage. Type any English word above to look it up.',
           );
         }
         break;
@@ -289,9 +355,11 @@ export function AiToolsPage({
     }
   };
 
-  const runAiTool = async (tool: ToolId) => {
+  const runAiTool = async (tool: ToolId, overrideWord?: string) => {
     clearOutputs(false);
-    if (!text.trim()) {
+    const chosenWord = (overrideWord ?? wordInput).trim();
+    const effectiveText = text.trim() || chosenWord;
+    if (!effectiveText) {
       setToolError('Paste or load a passage first.');
       return;
     }
@@ -308,9 +376,9 @@ export function AiToolsPage({
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          text,
+          text: effectiveText,
           task: apiTask,
-          targetWord: isWordTool ? wordInput.trim() || undefined : undefined,
+          targetWord: isWordTool ? chosenWord || undefined : undefined,
         }),
       });
 
@@ -594,12 +662,12 @@ export function AiToolsPage({
                       onKeyDown={(e) => {
                         if (e.key === 'Enter' && wordInput.trim()) {
                           e.preventDefault();
-                          void lookupDictionaryWord(wordInput);
+                          void lookupWordOrTamil(wordInput);
                         }
                       }}
-                      placeholder="Optional: type a specific English word (or leave empty for passage words)…"
+                      placeholder="Optional: type an English or Tamil word (or leave empty for passage words)…"
                       aria-label="Word to explain or find synonyms for"
-                      className={`flex-1 rounded-xl border px-3.5 py-2.5 text-sm min-h-[42px] ${tokens.input}`}
+                      className={`flex-1 rounded-xl border px-3.5 py-2.5 text-sm min-h-[42px] font-indic ${tokens.input}`}
                     />
                     {wordInput && (
                       <button
@@ -617,18 +685,18 @@ export function AiToolsPage({
                     )}
                     <button
                       type="button"
-                      onClick={() => void lookupDictionaryWord(wordInput)}
-                      disabled={dictLoading || !wordInput.trim()}
+                      onClick={() => void lookupWordOrTamil(wordInput)}
+                      disabled={dictLoading || loadingTool || !wordInput.trim()}
                       className="rounded-xl bg-teal-600 px-4 py-2.5 min-h-[42px] text-sm font-semibold text-white hover:bg-teal-500 disabled:opacity-45 whitespace-nowrap"
                     >
-                      {dictLoading ? 'Looking up…' : 'Look up word'}
+                      {dictLoading || loadingTool ? 'Looking up…' : 'Look up word'}
                     </button>
                   </div>
 
                   {difficultWords.length > 0 && (
                     <div className="space-y-1.5">
                       <p className={`text-xs font-semibold ${tokens.subtext}`}>
-                        Detected multi-syllable words (click to look up):
+                        Detected multi-syllable English words (click to look up):
                       </p>
                       <div className="flex flex-wrap gap-2">
                         {difficultWords.map((item) => (
@@ -639,6 +707,26 @@ export function AiToolsPage({
                             className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${tokens.secondaryBtn}`}
                           >
                             {item.word} ({item.syllables} syl)
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {longTamilWords.length > 0 && (
+                    <div className="space-y-1.5">
+                      <p className={`text-xs font-semibold ${tokens.subtext}`}>
+                        தமிழ் சொற்கள் (AI விளக்கம் / மாற்றுச் சொற்களுக்கு கிளிக் செய்யவும்):
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {longTamilWords.map((item) => (
+                          <button
+                            key={item.word}
+                            type="button"
+                            onClick={() => void lookupWordOrTamil(item.word)}
+                            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold font-indic transition-colors ${tokens.secondaryBtn}`}
+                          >
+                            {item.word}
                           </button>
                         ))}
                       </div>
@@ -791,6 +879,18 @@ export function AiToolsPage({
                     <div className="flex flex-wrap gap-2">
                       <button
                         type="button"
+                        onClick={() => void handleCopy(resultText, 'result-text')}
+                        className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${tokens.secondaryBtn}`}
+                      >
+                        {copiedId === 'result-text' ? (
+                          <Check className="h-3.5 w-3.5 text-teal-600" aria-hidden />
+                        ) : (
+                          <Copy className="h-3.5 w-3.5" aria-hidden />
+                        )}
+                        {copiedId === 'result-text' ? 'Copied' : 'Copy'}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => speech.play(resultText)}
                         className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${tokens.secondaryBtn}`}
                       >
@@ -831,7 +931,7 @@ export function AiToolsPage({
                   {wordChanges.length > 0 && (
                     <div className={`text-xs space-y-1 ${tokens.subtext}`}>
                       <p className="font-semibold">
-                        Plain-English word substitutions applied:
+                        Word substitutions applied:
                       </p>
                       <p>
                         {wordChanges
@@ -865,6 +965,23 @@ export function AiToolsPage({
                     <div className="flex flex-wrap gap-2">
                       <button
                         type="button"
+                        onClick={() =>
+                          void handleCopy(
+                            keyPoints.map((p, i) => `${i + 1}. ${p}`).join('\n'),
+                            'key-points',
+                          )
+                        }
+                        className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${tokens.secondaryBtn}`}
+                      >
+                        {copiedId === 'key-points' ? (
+                          <Check className="h-3.5 w-3.5 text-teal-600" aria-hidden />
+                        ) : (
+                          <Copy className="h-3.5 w-3.5" aria-hidden />
+                        )}
+                        {copiedId === 'key-points' ? 'Copied' : 'Copy'}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => speech.play(keyPoints.join(' '))}
                         className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${tokens.secondaryBtn}`}
                       >
@@ -895,7 +1012,7 @@ export function AiToolsPage({
                     {keyPoints.map((pt, i) => (
                       <li
                         key={i}
-                        className={`rounded-xl border p-3.5 text-sm leading-relaxed ${tokens.cardBg} ${tokens.border} ${tokens.text}`}
+                        className={`rounded-xl border p-3.5 text-sm leading-relaxed font-indic ${tokens.cardBg} ${tokens.border} ${tokens.text}`}
                       >
                         <span className="font-bold text-teal-600 mr-2 tabular-nums">
                           {i + 1}.
@@ -909,13 +1026,37 @@ export function AiToolsPage({
 
               {aiWords.length > 0 && (
                 <div className="space-y-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="inline-flex items-center rounded-md bg-teal-600 px-2 py-0.5 text-[11px] font-bold text-white">
-                      AI-Powered
-                    </span>
-                    <span className={`text-xs font-semibold ${tokens.subtext}`}>
-                      {resultSource}
-                    </span>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="inline-flex items-center rounded-md bg-teal-600 px-2 py-0.5 text-[11px] font-bold text-white">
+                        AI-Powered
+                      </span>
+                      <span className={`text-xs font-semibold ${tokens.subtext}`}>
+                        {resultSource}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void handleCopy(
+                          aiWords
+                            .map(
+                              (w) =>
+                                `${w.word}: ${w.simpleMeaning}${w.synonyms.length ? ` (${w.synonyms.join(', ')})` : ''}`,
+                            )
+                            .join('\n'),
+                          'ai-words',
+                        )
+                      }
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${tokens.secondaryBtn}`}
+                    >
+                      {copiedId === 'ai-words' ? (
+                        <Check className="h-3.5 w-3.5 text-teal-600" aria-hidden />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" aria-hidden />
+                      )}
+                      {copiedId === 'ai-words' ? 'Copied' : 'Copy'}
+                    </button>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     {aiWords.map((item, idx) => (
@@ -924,7 +1065,7 @@ export function AiToolsPage({
                         className={`rounded-2xl border p-4 space-y-2 ${tokens.cardBg} ${tokens.border}`}
                       >
                         <div className="flex items-center justify-between gap-2">
-                          <h3 className={`font-bold text-base ${tokens.text}`}>
+                          <h3 className={`font-bold text-base font-indic ${tokens.text}`}>
                             {item.word}
                           </h3>
                           <button
@@ -937,11 +1078,11 @@ export function AiToolsPage({
                             Listen
                           </button>
                         </div>
-                        <p className={`text-sm ${tokens.subtext}`}>
+                        <p className={`text-sm font-indic ${tokens.subtext}`}>
                           {item.simpleMeaning}
                         </p>
                         {item.synonyms.length > 0 && (
-                          <p className={`text-xs ${tokens.subtext}`}>
+                          <p className={`text-xs font-indic ${tokens.subtext}`}>
                             <span className="font-semibold">Simpler words: </span>
                             {item.synonyms.join(', ')}
                           </p>
@@ -954,13 +1095,37 @@ export function AiToolsPage({
 
               {aiQuestions.length > 0 && (
                 <div className="space-y-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="inline-flex items-center rounded-md bg-teal-600 px-2 py-0.5 text-[11px] font-bold text-white">
-                      AI-Powered
-                    </span>
-                    <span className={`text-xs font-semibold ${tokens.subtext}`}>
-                      {resultSource}
-                    </span>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="inline-flex items-center rounded-md bg-teal-600 px-2 py-0.5 text-[11px] font-bold text-white">
+                        AI-Powered
+                      </span>
+                      <span className={`text-xs font-semibold ${tokens.subtext}`}>
+                        {resultSource}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void handleCopy(
+                          aiQuestions
+                            .map(
+                              (q, i) =>
+                                `${i + 1}. ${q.question}\nAnswer: ${q.answer}`,
+                            )
+                            .join('\n\n'),
+                          'ai-questions',
+                        )
+                      }
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold ${tokens.secondaryBtn}`}
+                    >
+                      {copiedId === 'ai-questions' ? (
+                        <Check className="h-3.5 w-3.5 text-teal-600" aria-hidden />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" aria-hidden />
+                      )}
+                      {copiedId === 'ai-questions' ? 'Copied' : 'Copy'}
+                    </button>
                   </div>
                   {aiQuestions.map((q, idx) => (
                     <div

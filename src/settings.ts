@@ -32,6 +32,10 @@ export interface ReadingSettings {
   customBgColor: string | null;
   bionicReading: boolean;
   punctuationFocus: boolean;
+  mirrorLetterAlert: boolean;
+  englishSyllables: boolean;
+  tamilSyllableGrouping: boolean;
+  tamilVowelHighlight: boolean;
   chunkSize: number;
   rulerEnabled: boolean;
   rulerHeight: number;
@@ -57,6 +61,10 @@ export const DEFAULT_SETTINGS: ReadingSettings = {
   customBgColor: null,
   bionicReading: false,
   punctuationFocus: false,
+  mirrorLetterAlert: false,
+  englishSyllables: false,
+  tamilSyllableGrouping: false,
+  tamilVowelHighlight: false,
   chunkSize: 3,
   rulerEnabled: false,
   rulerHeight: 52,
