@@ -6,7 +6,7 @@ import express, {
 } from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
-export const MODEL_NAME = 'gemini-4-hydrogen';
+export const MODEL_NAME = process.env.GEMINI_MODEL?.trim() || 'gemini-4-hydrogen';
 export const FALLBACK_MODEL_NAME = 'gemini-3.1-flash-lite';
 
 const LANGUAGE_NAMES: Record<'en' | 'ta', string> = {
@@ -1100,6 +1100,13 @@ Rules:
             : 'Could not reach dictionary service.',
       });
     }
+  });
+
+  app.all('/api/{*splat}', (req: Request, res: Response) => {
+    res.status(404).json({
+      error: 'API_ROUTE_NOT_FOUND',
+      message: `API endpoint ${req.method} ${req.originalUrl} was not found.`,
+    });
   });
 
   app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
