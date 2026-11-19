@@ -89,7 +89,7 @@ async function prepareImagePayloadForVision(
     const bitmap = await createImageBitmap(blob);
     const { width, height } = bitmap;
     const maxDim = Math.max(width, height);
-    const scale = maxDim > 1600 ? 1600 / maxDim : 1;
+    const scale = maxDim > 1400 ? 1400 / maxDim : 1;
 
     const targetW = Math.max(1, Math.round(width * scale));
     const targetH = Math.max(1, Math.round(height * scale));
@@ -110,10 +110,19 @@ async function prepareImagePayloadForVision(
     ctx.drawImage(bitmap, 0, 0, targetW, targetH);
     bitmap.close();
 
-    const outputMime = blob.type === 'image/png' && blob.size < 900_000 ? 'image/png' : 'image/jpeg';
-    const quality = outputMime === 'image/jpeg' ? 0.9 : 1.0;
-    const dataUrl = canvas.toDataURL(outputMime, quality);
-    return { base64: dataUrl, mimeType: outputMime };
+    // Keep payloads well within serverless request body limits (e.g., Vercel 4.5 MB limit)
+    if (blob.type === 'image/png' && blob.size < 600_000) {
+      const pngUrl = canvas.toDataURL('image/png');
+      if (pngUrl.length <= 1_400_000) {
+        return { base64: pngUrl, mimeType: 'image/png' };
+      }
+    }
+
+    let jpegUrl = canvas.toDataURL('image/jpeg', 0.86);
+    if (jpegUrl.length > 2_400_000) {
+      jpegUrl = canvas.toDataURL('image/jpeg', 0.72);
+    }
+    return { base64: jpegUrl, mimeType: 'image/jpeg' };
   } catch {
     return fallbackRead(blob);
   }
@@ -383,30 +392,45 @@ export function ScanTextPage({
     }
 
     setOfflineAssetStatus('loading');
-    const langPath =
-      typeof window !== 'undefined'
-        ? `${window.location.origin}/tessdata`
-        : '/tessdata';
+    const origin =
+      typeof window !== 'undefined' ? window.location.origin : '';
+    const langPath = origin ? `${origin}/tessdata` : '/tessdata';
+    const workerPath = origin
+      ? `${origin}/tesseract/worker.min.js`
+      : '/tesseract/worker.min.js';
+    const corePath = origin ? `${origin}/tesseract` : '/tesseract';
 
     const createPromise = (async () => {
       const { createWorker, OEM, PSM } = await import('tesseract.js');
-      const worker = await withStepTimeout(
-        createWorker(lang, OEM.LSTM_ONLY, {
-          langPath,
-          cacheMethod: 'write',
-          logger: (msg) => {
-            tesseractLoggerCallbacks.get(lang)?.(
-              msg.status ?? '',
-              typeof msg.progress === 'number' ? msg.progress : undefined,
-            );
-          },
-          errorHandler: () => {
-            // Handled cleanly on rejection
-          },
-        }),
-        40000,
-        `Timed out loading the local ${lang} OCR pack. Check your connection if not cached yet and retry.`,
-      );
+      const initWithCache = async (cacheMethod: 'write' | 'none') =>
+        withStepTimeout(
+          createWorker(lang, OEM.LSTM_ONLY, {
+            langPath,
+            workerPath,
+            corePath,
+            cacheMethod,
+            logger: (msg) => {
+              tesseractLoggerCallbacks.get(lang)?.(
+                msg.status ?? '',
+                typeof msg.progress === 'number' ? msg.progress : undefined,
+              );
+            },
+            errorHandler: () => {
+              // Handled cleanly on rejection
+            },
+          }),
+          40000,
+          `Timed out loading the local ${lang} OCR pack. Please check your connection and retry.`,
+        );
+
+      let worker: Worker;
+      try {
+        worker = await initWithCache('write');
+      } catch {
+        // Fallback without IndexedDB caching for restricted storage / sandboxed iframes
+        worker = await initWithCache('none');
+      }
+
       await worker.setParameters({
         tessedit_pageseg_mode: PSM.AUTO,
         preserve_interword_spaces: '1',
@@ -512,130 +536,9 @@ export function ScanTextPage({
     setScanMeta(null);
     setProgress(null);
 
-    if (
-      (typeof navigator !== 'undefined' && navigator.onLine === false) ||
-      visionAvailableRef.current === false
-    ) {
-      const reason =
-        typeof navigator !== 'undefined' && navigator.onLine === false
-          ? 'Device appears offline; used local browser OCR instead.'
-          : 'Vision AI OCR is not configured on the server; used local browser OCR instead.';
+    const runFallbackSafely = async (notice: string) => {
       try {
-        await runLocalTesseractFallback(selectedFile, requestId, reason);
-      } catch (localErr) {
-        if (scanRequestIdRef.current === requestId) {
-          const detail =
-            localErr instanceof Error
-              ? localErr.message
-              : 'Could not extract text locally. Load the language pack while online once to cache it.';
-          setError(`Local OCR failed: ${detail}`);
-          setStatusLabel('');
-        }
-      } finally {
-        if (scanRequestIdRef.current === requestId) {
-          setScanning(false);
-        }
-      }
-      return;
-    }
-
-    setStatusLabel('Preparing image and reading printed or handwritten text…');
-
-    try {
-      const payload = await prepareImagePayloadForVision(selectedFile);
-      if (scanRequestIdRef.current !== requestId) return;
-
-      const controller = new AbortController();
-      visionAbortRef.current = controller;
-      const abortTimer = window.setTimeout(() => controller.abort(), 45000);
-
-      let visionResponse: Response;
-      try {
-        visionResponse = await fetch('/api/ocr', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            imageBase64: payload.base64,
-            mimeType: payload.mimeType,
-            languageHint: ocrLang,
-          }),
-        });
-      } finally {
-        window.clearTimeout(abortTimer);
-        if (visionAbortRef.current === controller) {
-          visionAbortRef.current = null;
-        }
-      }
-
-      if (scanRequestIdRef.current !== requestId) return;
-
-      type VisionOcrResponse = {
-        error?: string;
-        message?: string;
-        text?: string;
-        detectedLanguage?: string;
-        writingStyle?: string;
-        uncertain?: boolean;
-        uncertaintyNote?: string;
-      };
-      const raw = await visionResponse.text();
-      let data: VisionOcrResponse | null = null;
-
-      try {
-        data = JSON.parse(raw) as VisionOcrResponse;
-      } catch {
-        data = null;
-      }
-
-      if (scanRequestIdRef.current !== requestId) return;
-
-      if (visionResponse.ok && data) {
-        const cleaned = cleanRecognizedText(data.text ?? '');
-        if (!cleaned) {
-          setError(
-            data.uncertaintyNote ||
-              'No readable English or Tamil text was detected in this image. Try brighter lighting or a closer photo.',
-          );
-          setStatusLabel('');
-          return;
-        }
-
-        setExtractedText(cleaned);
-        setStatusLabel('Text extraction complete');
-        setScanMeta({
-          engine: 'Vision AI OCR',
-          detectedLanguage: data.detectedLanguage,
-          writingStyle: data.writingStyle,
-        });
-        if (data.uncertain || data.uncertaintyNote) {
-          setUncertaintyWarning(
-            data.uncertaintyNote ||
-              'Some handwritten or low-contrast words may be uncertain. Please review and edit the text on the right if needed.',
-          );
-        }
-        return;
-      }
-
-      // If Vision AI is unavailable or fails, automatically fall back to local printed OCR
-      if (data?.error === 'AI_NOT_CONFIGURED') {
-        visionAvailableRef.current = false;
-      }
-      const fallbackMsg =
-        data?.message ||
-        `Vision AI OCR is temporarily unavailable (HTTP ${visionResponse.status}).`;
-      await runLocalTesseractFallback(selectedFile, requestId, fallbackMsg);
-    } catch (err) {
-      if (scanRequestIdRef.current !== requestId) return;
-      // Network/timeout on Vision AI -> try cached local printed fallback
-      try {
-        await runLocalTesseractFallback(
-          selectedFile,
-          requestId,
-          err instanceof Error && err.name === 'AbortError'
-            ? 'Vision AI request timed out; used local printed OCR instead.'
-            : 'Could not reach Vision AI; used local printed OCR instead.',
-        );
+        await runLocalTesseractFallback(selectedFile, requestId, notice);
       } catch (localErr) {
         if (scanRequestIdRef.current === requestId) {
           const detail =
@@ -645,6 +548,117 @@ export function ScanTextPage({
           setError(`OCR failed: ${detail}`);
           setStatusLabel('');
         }
+      }
+    };
+
+    try {
+      if (
+        (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+        visionAvailableRef.current === false
+      ) {
+        const reason =
+          typeof navigator !== 'undefined' && navigator.onLine === false
+            ? 'Device appears offline; used local browser OCR instead.'
+            : 'Vision AI OCR is not configured on the server; used local browser OCR instead.';
+        await runFallbackSafely(reason);
+        return;
+      }
+
+      setStatusLabel('Preparing image and reading printed or handwritten text…');
+
+      let fallbackReason: string | null = null;
+      try {
+        const payload = await prepareImagePayloadForVision(selectedFile);
+        if (scanRequestIdRef.current !== requestId) return;
+
+        const controller = new AbortController();
+        visionAbortRef.current = controller;
+        const abortTimer = window.setTimeout(() => controller.abort(), 35000);
+
+        let visionResponse: Response;
+        try {
+          visionResponse = await fetch('/api/ocr', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              imageBase64: payload.base64,
+              mimeType: payload.mimeType,
+              languageHint: ocrLang,
+            }),
+          });
+        } finally {
+          window.clearTimeout(abortTimer);
+          if (visionAbortRef.current === controller) {
+            visionAbortRef.current = null;
+          }
+        }
+
+        if (scanRequestIdRef.current !== requestId) return;
+
+        type VisionOcrResponse = {
+          error?: string;
+          message?: string;
+          text?: string;
+          detectedLanguage?: string;
+          writingStyle?: string;
+          uncertain?: boolean;
+          uncertaintyNote?: string;
+        };
+        const raw = await visionResponse.text();
+        let data: VisionOcrResponse | null = null;
+
+        try {
+          data = JSON.parse(raw) as VisionOcrResponse;
+        } catch {
+          data = null;
+        }
+
+        if (scanRequestIdRef.current !== requestId) return;
+
+        if (visionResponse.ok && data) {
+          const cleaned = cleanRecognizedText(data.text ?? '');
+          if (!cleaned) {
+            setError(
+              data.uncertaintyNote ||
+                'No readable English or Tamil text was detected in this image. Try brighter lighting or a closer photo.',
+            );
+            setStatusLabel('');
+            return;
+          }
+
+          setExtractedText(cleaned);
+          setStatusLabel('Text extraction complete');
+          setScanMeta({
+            engine: 'Vision AI OCR',
+            detectedLanguage: data.detectedLanguage,
+            writingStyle: data.writingStyle,
+          });
+          if (data.uncertain || data.uncertaintyNote) {
+            setUncertaintyWarning(
+              data.uncertaintyNote ||
+                'Some handwritten or low-contrast words may be uncertain. Please review and edit the text on the right if needed.',
+            );
+          }
+          return;
+        }
+
+        if (data?.error === 'AI_NOT_CONFIGURED') {
+          visionAvailableRef.current = false;
+        }
+        fallbackReason =
+          data?.message ||
+          'Vision AI OCR is temporarily unavailable; extracted using local browser OCR instead.';
+      } catch (err) {
+        if (scanRequestIdRef.current !== requestId) return;
+        fallbackReason =
+          err instanceof Error && err.name === 'AbortError'
+            ? 'Vision AI request timed out; used local printed OCR instead.'
+            : 'Could not reach Vision AI; used local printed OCR instead.';
+      }
+
+      if (fallbackReason) {
+        await runFallbackSafely(fallbackReason);
       }
     } finally {
       if (scanRequestIdRef.current === requestId) {
@@ -1030,9 +1044,19 @@ export function ScanTextPage({
           {error && (
             <div
               role="alert"
-              className="rounded-xl border border-coral-500/40 bg-coral-500/10 px-4 py-3 text-sm font-medium text-coral-600"
+              className="rounded-xl border border-coral-500/40 bg-coral-500/10 px-4 py-3 text-sm font-medium text-coral-600 flex flex-wrap items-center justify-between gap-3"
             >
-              {error}
+              <span>{error}</span>
+              {selectedFile && !scanning && (
+                <button
+                  type="button"
+                  onClick={runOcr}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-coral-500/40 bg-white/80 px-3 py-1 text-xs font-semibold text-coral-700 hover:bg-white shrink-0"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                  Retry
+                </button>
+              )}
             </div>
           )}
         </section>

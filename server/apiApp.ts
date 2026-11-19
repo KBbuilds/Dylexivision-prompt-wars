@@ -1,4 +1,9 @@
-import express, { type Express, type Request, type Response } from 'express';
+import express, {
+  type Express,
+  type NextFunction,
+  type Request,
+  type Response,
+} from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 export const MODEL_NAME = 'gemini-4-hydrogen';
@@ -169,7 +174,8 @@ async function callGeminiWithFallback<T>(
   timeoutMs = 20000,
 ): Promise<{ result: T; modelUsed: string }> {
   const inCooldown = Date.now() < primaryCooldownUntil;
-  const primaryTimeout = Math.min(timeoutMs, 11000);
+  const primaryTimeout = Math.min(timeoutMs, 9000);
+  const fallbackTimeout = Math.min(timeoutMs, 11000);
   const attempts: Array<{
     model: string;
     thinkingLevel: ThinkingLevel;
@@ -180,13 +186,13 @@ async function callGeminiWithFallback<T>(
         {
           model: FALLBACK_MODEL_NAME,
           thinkingLevel: ThinkingLevel.MINIMAL,
-          ms: timeoutMs,
-          backoffMs: 700,
+          ms: fallbackTimeout,
+          backoffMs: 400,
         },
         {
           model: FALLBACK_MODEL_NAME,
           thinkingLevel: ThinkingLevel.MINIMAL,
-          ms: timeoutMs,
+          ms: fallbackTimeout,
           backoffMs: 0,
         },
       ]
@@ -200,13 +206,7 @@ async function callGeminiWithFallback<T>(
         {
           model: FALLBACK_MODEL_NAME,
           thinkingLevel: ThinkingLevel.MINIMAL,
-          ms: timeoutMs,
-          backoffMs: 700,
-        },
-        {
-          model: FALLBACK_MODEL_NAME,
-          thinkingLevel: ThinkingLevel.MINIMAL,
-          ms: timeoutMs,
+          ms: fallbackTimeout,
           backoffMs: 0,
         },
       ];
@@ -220,8 +220,10 @@ async function callGeminiWithFallback<T>(
     } catch (err) {
       lastError = err;
       const classified = classifyGeminiError(err);
-      const canFallback = classified.retryable || classified.status === 429;
-      if (!canFallback || i === attempts.length - 1) {
+      const canTryFallback =
+        classified.code !== 'GEMINI_KEY_ERROR' &&
+        (model === MODEL_NAME || classified.retryable || classified.status === 429);
+      if (!canTryFallback || i === attempts.length - 1) {
         throw err;
       }
       if (model === MODEL_NAME) {
@@ -594,9 +596,18 @@ export function createApiApp(): Express {
       return;
     }
 
-    const cleanedBase64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
-    if (!cleanedBase64 || cleanedBase64.length > 7_500_000) {
-      res.status(400).json({ error: 'Image is missing or exceeds maximum size.' });
+    const cleanedBase64 = imageBase64
+      .replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '')
+      .replace(/\s+/g, '');
+    if (
+      !cleanedBase64 ||
+      cleanedBase64.length > 7_500_000 ||
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(cleanedBase64)
+    ) {
+      res.status(400).json({
+        error: 'INVALID_IMAGE_PAYLOAD',
+        message: 'Image payload is missing, malformed, or exceeds maximum size.',
+      });
       return;
     }
 
@@ -675,13 +686,20 @@ Rules:
         20000,
       );
 
+      let rawResponseText: string | undefined;
+      try {
+        rawResponseText = response.text;
+      } catch {
+        rawResponseText = undefined;
+      }
+
       const parsed = parseGeminiJson<{
         text: string;
         detectedLanguage: string;
         writingStyle: string;
         uncertain: boolean;
         uncertaintyNote: string;
-      }>(response.text, {
+      }>(rawResponseText, {
         text: '',
         detectedLanguage: 'Unknown',
         writingStyle: 'Unclear',
@@ -1082,6 +1100,32 @@ Rules:
             : 'Could not reach dictionary service.',
       });
     }
+  });
+
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const errObj = err as { status?: number; type?: string; message?: string } | undefined;
+    if (errObj?.type === 'entity.too.large' || errObj?.status === 413) {
+      res.status(413).json({
+        error: 'PAYLOAD_TOO_LARGE',
+        message: 'Image payload is too large for the OCR request. Please try a smaller or cropped image.',
+      });
+      return;
+    }
+    if (errObj?.type === 'entity.parse.failed' || errObj?.status === 400) {
+      res.status(400).json({
+        error: 'INVALID_JSON',
+        message: 'Invalid JSON request body.',
+      });
+      return;
+    }
+    res.status(500).json({
+      error: 'INTERNAL_SERVER_ERROR',
+      message: errObj?.message || 'Unexpected server error occurred.',
+    });
   });
 
   return app;
