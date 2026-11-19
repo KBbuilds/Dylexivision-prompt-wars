@@ -162,11 +162,28 @@ export function TamilTranslator({
   const handleCopy = async () => {
     if (!outputText.trim()) return;
     setCopyError(null);
+    let ok = false;
     try {
       await navigator.clipboard.writeText(outputText);
+      ok = true;
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = outputText;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
-    } catch {
+    } else {
       setCopyError('Clipboard access was blocked by the browser.');
     }
   };

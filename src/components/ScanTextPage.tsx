@@ -10,7 +10,9 @@ import {
   AlertTriangle,
   ArrowRight,
   BookmarkCheck,
+  Check,
   CheckCircle2,
+  Copy,
   Eraser,
   FileImage,
   FileText,
@@ -53,6 +55,10 @@ const UPCOMING_OCR_LANGUAGES = [
 // Module-level worker cache so language packs & WASM engines are reused across uploads
 const cachedTesseractWorkers = new Map<OcrLanguageCode, Promise<Worker>>();
 const loadedOfflinePacks = new Set<OcrLanguageCode>();
+const tesseractLoggerCallbacks = new Map<
+  OcrLanguageCode,
+  (status: string, p?: number) => void
+>();
 
 /**
  * Fast client-side image downscaling for Vision AI without slow grayscale pixel loops.
@@ -148,7 +154,13 @@ async function prepareImageForTesseract(blob: File | Blob): Promise<File | Blob>
     ctx.fillRect(0, 0, targetW, targetH);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
+    if ('filter' in ctx) {
+      ctx.filter = 'grayscale(1) contrast(1.2)';
+    }
     ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+    if ('filter' in ctx) {
+      ctx.filter = 'none';
+    }
     bitmap.close();
 
     const processed = await new Promise<Blob | null>((resolve) =>
@@ -195,15 +207,36 @@ export function ScanTextPage({
       loadedOfflinePacks.has('eng') ? 'ready' : 'not-loaded',
     );
   const [savedFeedback, setSavedFeedback] = useState<string | null>(null);
+  const [copiedOcr, setCopiedOcr] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const scanRequestIdRef = useRef(0);
+  const visionAbortRef = useRef<AbortController | null>(null);
+  const visionAvailableRef = useRef<boolean | null>(null);
 
   useEffect(() => {
     setOfflineAssetStatus(
       loadedOfflinePacks.has(ocrLang) ? 'ready' : 'not-loaded',
     );
   }, [ocrLang]);
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/ai/status')
+      .then((r) => r.json())
+      .then((data: { aiConfigured?: boolean }) => {
+        if (active) {
+          visionAvailableRef.current = Boolean(data.aiConfigured);
+        }
+      })
+      .catch(() => {
+        // Leave null so scan decides cleanly at runtime
+      });
+    return () => {
+      active = false;
+      visionAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -213,12 +246,49 @@ export function ScanTextPage({
 
   const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
-  const validateAndLoadImage = (file: File | Blob, sourceLabel: 'file' | 'drop' | 'paste') => {
-    if (!file.type.startsWith('image/')) {
+  const verifyImageDecodes = async (blob: Blob): Promise<boolean> => {
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bmp = await createImageBitmap(blob);
+        bmp.close();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    if (typeof Image === 'undefined') return true;
+    const url = URL.createObjectURL(blob);
+    try {
+      return await new Promise<boolean>((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve(img.naturalWidth > 0 && img.naturalHeight > 0);
+        img.onerror = () => resolve(false);
+        img.src = url;
+      });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const validateAndLoadImage = async (
+    file: File | Blob,
+    sourceLabel: 'file' | 'drop' | 'paste',
+  ) => {
+    const fileName = 'name' in file ? String(file.name || '') : '';
+    const isSvg =
+      file.type === 'image/svg+xml' || /\.svg$/i.test(fileName);
+    const hasRasterMime = file.type.startsWith('image/') && !isSvg;
+    const hasImageExt =
+      !file.type &&
+      /\.(png|jpe?g|webp|gif|bmp|tiff?|heic|avif)$/i.test(fileName);
+
+    if (isSvg || (!hasRasterMime && !hasImageExt)) {
       setError(
-        sourceLabel === 'drop'
-          ? 'Please drop a valid image file (PNG, JPG, WebP, etc.).'
-          : 'Please select a valid image file (PNG, JPG, WebP, etc.).',
+        isSvg
+          ? 'SVG files are not supported for OCR. Please use a PNG, JPG, or WebP image.'
+          : sourceLabel === 'drop'
+            ? 'Please drop a valid image file (PNG, JPG, WebP, etc.).'
+            : 'Please select a valid image file (PNG, JPG, WebP, etc.).',
       );
       return false;
     }
@@ -230,11 +300,24 @@ export function ScanTextPage({
       setError('Image exceeds 20 MB. Please choose a smaller or cropped image.');
       return false;
     }
+
+    const requestToken = ++scanRequestIdRef.current;
+    const decodes = await verifyImageDecodes(file);
+    if (scanRequestIdRef.current !== requestToken) return false;
+    if (!decodes) {
+      setError(
+        'Could not decode this image. The file may be corrupted or in an unsupported format.',
+      );
+      return false;
+    }
+
     loadImageBlob(file);
     return true;
   };
 
   const loadImageBlob = (blob: File | Blob) => {
+    visionAbortRef.current?.abort();
+    visionAbortRef.current = null;
     scanRequestIdRef.current += 1;
     setScanning(false);
     setError(null);
@@ -253,7 +336,7 @@ export function ScanTextPage({
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    validateAndLoadImage(file, 'file');
+    void validateAndLoadImage(file, 'file');
   };
 
   const handlePaste = (e: ClipboardEvent<HTMLDivElement>) => {
@@ -265,7 +348,7 @@ export function ScanTextPage({
         const blob = item.getAsFile();
         if (blob) {
           e.preventDefault();
-          validateAndLoadImage(blob, 'paste');
+          void validateAndLoadImage(blob, 'paste');
           break;
         }
       }
@@ -293,20 +376,26 @@ export function ScanTextPage({
     lang: OcrLanguageCode,
     onLogger: (status: string, p?: number) => void,
   ): Promise<Worker> => {
+    tesseractLoggerCallbacks.set(lang, onLogger);
     const existing = cachedTesseractWorkers.get(lang);
     if (existing) {
       return existing;
     }
 
     setOfflineAssetStatus('loading');
+    const langPath =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/tessdata`
+        : '/tessdata';
+
     const createPromise = (async () => {
       const { createWorker, OEM, PSM } = await import('tesseract.js');
       const worker = await withStepTimeout(
         createWorker(lang, OEM.LSTM_ONLY, {
-          langPath: '/tessdata',
+          langPath,
           cacheMethod: 'write',
           logger: (msg) => {
-            onLogger(
+            tesseractLoggerCallbacks.get(lang)?.(
               msg.status ?? '',
               typeof msg.progress === 'number' ? msg.progress : undefined,
             );
@@ -423,20 +512,23 @@ export function ScanTextPage({
     setScanMeta(null);
     setProgress(null);
 
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    if (
+      (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+      visionAvailableRef.current === false
+    ) {
+      const reason =
+        typeof navigator !== 'undefined' && navigator.onLine === false
+          ? 'Device appears offline; used local browser OCR instead.'
+          : 'Vision AI OCR is not configured on the server; used local browser OCR instead.';
       try {
-        await runLocalTesseractFallback(
-          selectedFile,
-          requestId,
-          'Device appears offline; used local browser OCR instead.',
-        );
+        await runLocalTesseractFallback(selectedFile, requestId, reason);
       } catch (localErr) {
         if (scanRequestIdRef.current === requestId) {
           const detail =
             localErr instanceof Error
               ? localErr.message
-              : 'Could not extract text offline. Load the language pack while online once to cache it.';
-          setError(`Offline OCR failed: ${detail}`);
+              : 'Could not extract text locally. Load the language pack while online once to cache it.';
+          setError(`Local OCR failed: ${detail}`);
           setStatusLabel('');
         }
       } finally {
@@ -454,6 +546,7 @@ export function ScanTextPage({
       if (scanRequestIdRef.current !== requestId) return;
 
       const controller = new AbortController();
+      visionAbortRef.current = controller;
       const abortTimer = window.setTimeout(() => controller.abort(), 45000);
 
       let visionResponse: Response;
@@ -470,6 +563,9 @@ export function ScanTextPage({
         });
       } finally {
         window.clearTimeout(abortTimer);
+        if (visionAbortRef.current === controller) {
+          visionAbortRef.current = null;
+        }
       }
 
       if (scanRequestIdRef.current !== requestId) return;
@@ -522,6 +618,9 @@ export function ScanTextPage({
       }
 
       // If Vision AI is unavailable or fails, automatically fall back to local printed OCR
+      if (data?.error === 'AI_NOT_CONFIGURED') {
+        visionAvailableRef.current = false;
+      }
       const fallbackMsg =
         data?.message ||
         `Vision AI OCR is temporarily unavailable (HTTP ${visionResponse.status}).`;
@@ -555,6 +654,8 @@ export function ScanTextPage({
   };
 
   const resetAll = () => {
+    visionAbortRef.current?.abort();
+    visionAbortRef.current = null;
     scanRequestIdRef.current += 1;
     setScanning(false);
     if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
@@ -568,6 +669,33 @@ export function ScanTextPage({
     setUncertaintyWarning(null);
     setScanMeta(null);
     setSavedFeedback(null);
+    setCopiedOcr(false);
+  };
+
+  const handleCopyExtracted = async () => {
+    if (!extractedText.trim()) return;
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(extractedText);
+      ok = true;
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = extractedText;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
+      setCopiedOcr(true);
+      window.setTimeout(() => setCopiedOcr(false), 2000);
+    }
   };
 
   return (
@@ -792,7 +920,7 @@ export function ScanTextPage({
                 e.preventDefault();
                 const file = e.dataTransfer.files?.[0];
                 if (file) {
-                  validateAndLoadImage(file, 'drop');
+                  void validateAndLoadImage(file, 'drop');
                 }
               }}
               className={`rounded-2xl border-2 border-dashed p-8 text-center space-y-2 ${tokens.border}`}
@@ -836,6 +964,8 @@ export function ScanTextPage({
                     <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
                     {progress !== null ? `Scanning (${progress}%)…` : 'Reading image…'}
                   </>
+                ) : extractedText.trim() ? (
+                  'Rescan image'
                 ) : (
                   'Extract text from image'
                 )}
@@ -913,15 +1043,47 @@ export function ScanTextPage({
           className={`rounded-3xl border p-5 sm:p-6 flex flex-col justify-between gap-4 ${tokens.panelBg} ${tokens.border}`}
         >
           <div className="space-y-3 flex-1 flex flex-col">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className={`text-lg font-bold ${tokens.text}`}>
-                Extracted text (editable)
-              </h2>
-              {extractedText.trim() && (
-                <span className={`text-xs tabular-nums ${tokens.subtext}`}>
-                  {extractedText.trim().split(/\s+/).length} words
-                </span>
-              )}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className={`text-lg font-bold ${tokens.text}`}>
+                  Extracted text (editable)
+                </h2>
+                {extractedText.trim() && (
+                  <span className={`text-xs tabular-nums ${tokens.subtext}`}>
+                    {extractedText.trim().split(/\s+/).length} words
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleCopyExtracted()}
+                  disabled={!extractedText.trim()}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 min-h-[34px] text-xs font-semibold disabled:opacity-45 disabled:cursor-not-allowed ${tokens.secondaryBtn}`}
+                >
+                  {copiedOcr ? (
+                    <Check className="h-3.5 w-3.5 text-teal-600" aria-hidden />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {copiedOcr ? 'Copied' : 'Copy'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setExtractedText('');
+                    setScanMeta(null);
+                    setUncertaintyWarning(null);
+                    setSavedFeedback(null);
+                    setCopiedOcr(false);
+                  }}
+                  disabled={!extractedText}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 min-h-[34px] text-xs font-semibold disabled:opacity-45 disabled:cursor-not-allowed ${tokens.secondaryBtn}`}
+                >
+                  <Eraser className="h-3.5 w-3.5" aria-hidden />
+                  Clear
+                </button>
+              </div>
             </div>
 
             <textarea

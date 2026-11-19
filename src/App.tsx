@@ -119,16 +119,24 @@ export default function App() {
     setSettings({ ...DEFAULT_SETTINGS });
   }, []);
 
-  const handleTextChange = useCallback((nextText: string) => {
-    setText(nextText);
-    setActiveLibraryId(null);
-    setInitialSentenceIndex(0);
-    try {
-      localStorage.setItem(TEXT_KEY, nextText);
-    } catch {
-      // storage unavailable
-    }
-  }, []);
+  const { stop: stopSpeech, speaking: speechSpeaking, activeSpeechMode } = speech;
+
+  const handleTextChange = useCallback(
+    (nextText: string) => {
+      if (speechSpeaking && activeSpeechMode === 'passage') {
+        stopSpeech();
+      }
+      setText(nextText);
+      setActiveLibraryId(null);
+      setInitialSentenceIndex(0);
+      try {
+        localStorage.setItem(TEXT_KEY, nextText);
+      } catch {
+        // storage unavailable
+      }
+    },
+    [speechSpeaking, activeSpeechMode, stopSpeech],
+  );
 
   const handleLoadSample = useCallback(() => {
     handleTextChange(SAMPLE_TEXT);
@@ -136,6 +144,9 @@ export default function App() {
 
   const navigate = useCallback(
     (nextRoute: AppRoute) => {
+      if (nextRoute !== route && speechSpeaking) {
+        stopSpeech();
+      }
       setViewMode('app');
       setRoute(nextRoute);
       setMobileMenuOpen(false);
@@ -143,7 +154,7 @@ export default function App() {
         handleSettingsChange({ readingMode: 'comfortable' });
       }
     },
-    [settings.readingMode, handleSettingsChange],
+    [route, speechSpeaking, stopSpeech, settings.readingMode, handleSettingsChange],
   );
 
   const handleGetStarted = useCallback(
@@ -193,6 +204,12 @@ export default function App() {
 
   const handleOpenInStudio = useCallback(
     (nextText?: string, source: LibraryItem['source'] = 'typed') => {
+      if (
+        (typeof nextText === 'string' && nextText.trim()) ||
+        (speechSpeaking && activeSpeechMode === 'translation')
+      ) {
+        stopSpeech();
+      }
       if (typeof nextText === 'string' && nextText.trim()) {
         setText(nextText);
         try {
@@ -218,27 +235,31 @@ export default function App() {
       setRoute('studio');
       setMobileMenuOpen(false);
     },
-    [text, activeLibraryId],
+    [text, activeLibraryId, speechSpeaking, activeSpeechMode, stopSpeech],
   );
 
-  const handleOpenLibraryItem = useCallback((item: LibraryItem) => {
-    setText(item.content);
-    try {
-      localStorage.setItem(TEXT_KEY, item.content);
-    } catch {
-      // ignore
-    }
-    setActiveLibraryId(item.id);
-    setInitialSentenceIndex(item.progressSentenceIndex || 0);
-    const updated = updateReadingProgress(
-      item.id,
-      item.progressSentenceIndex || 0,
-      item.totalSentences || 1,
-    );
-    setLibrary(updated);
-    setRoute('studio');
-    setMobileMenuOpen(false);
-  }, []);
+  const handleOpenLibraryItem = useCallback(
+    (item: LibraryItem) => {
+      stopSpeech();
+      setText(item.content);
+      try {
+        localStorage.setItem(TEXT_KEY, item.content);
+      } catch {
+        // ignore
+      }
+      setActiveLibraryId(item.id);
+      setInitialSentenceIndex(item.progressSentenceIndex || 0);
+      const updated = updateReadingProgress(
+        item.id,
+        item.progressSentenceIndex || 0,
+        item.totalSentences || 1,
+      );
+      setLibrary(updated);
+      setRoute('studio');
+      setMobileMenuOpen(false);
+    },
+    [stopSpeech],
+  );
 
   const handleProgressChange = useCallback(
     (sentenceIndex: number, totalSentences: number) => {
@@ -293,6 +314,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
+                stopSpeech();
                 setViewMode('landing');
                 setMobileMenuOpen(false);
                 window.scrollTo({ top: 0 });
@@ -314,6 +336,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
+                  stopSpeech();
                   setViewMode('landing');
                   window.scrollTo({ top: 0 });
                 }}
@@ -392,6 +415,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
+                  stopSpeech();
                   setViewMode('landing');
                   setMobileMenuOpen(false);
                   window.scrollTo({ top: 0 });

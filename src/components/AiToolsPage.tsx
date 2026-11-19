@@ -148,14 +148,29 @@ export function AiToolsPage({
   const longTamilWords = useMemo(() => detectLongTamilWords(text), [text]);
 
   const handleCopy = async (content: string, id: string) => {
+    let ok = false;
     try {
       await navigator.clipboard.writeText(content);
+      ok = true;
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = content;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
       setCopiedId(id);
       window.setTimeout(() => {
         setCopiedId((prev) => (prev === id ? null : prev));
       }, 2000);
-    } catch {
-      // Clipboard blocked in iframe fallback: no crash
     }
   };
 

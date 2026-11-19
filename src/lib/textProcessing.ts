@@ -267,7 +267,7 @@ export function simplifyTextOffline(text: string): {
   const outputParagraphs: string[] = [];
 
   for (const para of paragraphs) {
-    const isTamilPara = TAMIL_CHAR_RE.test(para);
+    const hasTamilInPara = TAMIL_CHAR_RE.test(para);
 
     // 1. Replace formal words (English word boundaries or Unicode token boundaries for Tamil)
     let replaced = para.replace(/\b[A-Za-z]+\b/g, (word) => {
@@ -281,7 +281,7 @@ export function simplifyTextOffline(text: string): {
       return sub;
     });
 
-    if (isTamilPara) {
+    if (hasTamilInPara) {
       replaced = replaced.replace(
         /(^|[\s,.?!;:"'“”‘’()[\]])([^\s,.?!;:"'“”‘’()[\]]+)(?=$|[\s,.?!;:"'“”‘’()[\]])/gu,
         (full, prefix: string, word: string) => {
@@ -293,33 +293,35 @@ export function simplifyTextOffline(text: string): {
       );
     }
 
-    // 2. Break very long sentences at clause markers
+    // 2. Break very long sentences at clause markers (per sentence so mixed Tamil+English paragraphs work)
     const rawSentences = splitSentences(replaced);
-
     const shortSentences: string[] = [];
-    const wordThreshold = isTamilPara ? 12 : 16;
 
     for (const s of rawSentences) {
+      const hasTamilSentence = TAMIL_CHAR_RE.test(s);
+      const hasEnglishWords = /[A-Za-z]{3,}/.test(s);
+      const wordThreshold = hasTamilSentence && !hasEnglishWords ? 12 : 16;
+
       if (s.split(/\s+/).length <= wordThreshold) {
         shortSentences.push(s);
         continue;
       }
 
-      const parts = isTamilPara
-        ? s
-            .split(
-              /\s*[;—]\s*|\s*,\s+(?=(?:ஆனால்|ஏனென்றால்|அதனால்|இருந்தாலும்|அத்துடன்|மேலும்)(?:\s|$))/u,
-            )
-            .map((part) => part.trim())
-            .filter(Boolean)
-        : s
-            .split(/\s*[;—]\s*|\s*,\s+(?=(?:but|so|because|although|however|while)\b)/i)
-            .map((part) => part.trim())
-            .filter(Boolean);
+      const splitPattern =
+        hasTamilSentence && hasEnglishWords
+          ? /\s*[;—]\s*|\s*,\s+(?=(?:but|so|because|although|however|while)\b|(?:ஆனால்|ஏனென்றால்|அதனால்|இருந்தாலும்|அத்துடன்|மேலும்)(?:\s|$))/iu
+          : hasTamilSentence
+            ? /\s*[;—]\s*|\s*,\s+(?=(?:ஆனால்|ஏனென்றால்|அதனால்|இருந்தாலும்|அத்துடன்|மேலும்)(?:\s|$))/u
+            : /\s*[;—]\s*|\s*,\s+(?=(?:but|so|because|although|however|while)\b)/i;
+
+      const parts = s
+        .split(splitPattern)
+        .map((part) => part.trim())
+        .filter(Boolean);
 
       for (let i = 0; i < parts.length; i += 1) {
         let p = parts[i];
-        if (!isTamilPara) {
+        if (/^[a-z]/.test(p)) {
           p = p.charAt(0).toUpperCase() + p.slice(1);
         }
         if (!/[.!?]$/.test(p)) p += '.';
@@ -790,7 +792,18 @@ export function splitEnglishSyllables(word: string): string[] {
         i >= 2 &&
         !(lower[i - 1] === 'l' && !isAsciiVowel(lower[i - 2]));
 
-      if (isSilentTrailingE) {
+      // Skip silent '-ed' vowel when preceded by a consonant other than t/d
+      const isSilentTrailingEd =
+        ch === 'e' &&
+        i === lower.length - 2 &&
+        lower[i + 1] === 'd' &&
+        vowelSpans.length >= 1 &&
+        i >= 2 &&
+        lower[i - 1] !== 't' &&
+        lower[i - 1] !== 'd' &&
+        !isAsciiVowel(lower[i - 1]);
+
+      if (isSilentTrailingE || isSilentTrailingEd) {
         i += 1;
         continue;
       }
@@ -840,6 +853,12 @@ export function splitEnglishSyllables(word: string): string[] {
       } else {
         cuts.push(leftEnd + 1);
       }
+    } else if (between === 'ght') {
+      // Keep silent "gh" with preceding vowel: daugh·ter, migh·ty, frigh·ten
+      cuts.push(leftEnd + 2);
+    } else if (between.startsWith('ght')) {
+      // Compound words after -ght: light·house, night·fall, bright·ness
+      cuts.push(leftEnd + 3);
     } else {
       const lastTwo = between.slice(-2);
       if (EN_DIGRAPHS.has(lastTwo)) {

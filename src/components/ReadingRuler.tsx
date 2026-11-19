@@ -49,7 +49,7 @@ export function ReadingRuler({
   onDisable,
   children,
 }: ReadingRulerProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
   const [rulerY, setRulerY] = useState(140);
   const [locked, setLocked] = useState(false);
 
@@ -57,13 +57,39 @@ export function ReadingRuler({
     focusArea === 'narrow' ? 0.75 : focusArea === 'wide' ? 1.45 : 1;
   const effectiveHeight = Math.round(height * areaMultiplier);
 
-  const moveRuler = (deltaY: number) => {
-    const container = containerRef.current;
-    const maxH = container ? container.clientHeight : 600;
-    setRulerY((prev) =>
-      Math.max(effectiveHeight / 2, Math.min(maxH - effectiveHeight / 2, prev + deltaY)),
-    );
+  const clampRulerY = (y: number, containerHeight: number) => {
+    const half = effectiveHeight / 2;
+    const maxCenter = Math.max(half, containerHeight - half);
+    return Math.max(half, Math.min(maxCenter, y));
   };
+
+  const moveRuler = (deltaY: number) => {
+    const surface = surfaceRef.current;
+    const maxH = surface ? surface.clientHeight : 600;
+    setRulerY((prev) => clampRulerY(prev + deltaY, maxH));
+  };
+
+  useEffect(() => {
+    if (!enabled) return;
+    const surface = surfaceRef.current;
+    if (!surface) return;
+
+    const syncBounds = () => {
+      const h = surface.clientHeight;
+      if (h > 0) {
+        const half = effectiveHeight / 2;
+        const maxCenter = Math.max(half, h - half);
+        setRulerY((prev) => Math.max(half, Math.min(maxCenter, prev)));
+      }
+    };
+    syncBounds();
+
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(syncBounds);
+      ro.observe(surface);
+      return () => ro.disconnect();
+    }
+  }, [enabled, effectiveHeight]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -78,15 +104,15 @@ export function ReadingRuler({
         return;
       }
       const step = Math.max(24, Math.round(effectiveHeight * 0.65));
-      const container = containerRef.current;
-      const maxH = container ? container.clientHeight : 600;
+      const surface = surfaceRef.current;
+      const maxH = surface ? surface.clientHeight : 600;
       if (e.key === 'ArrowDown' || e.key === 'j') {
         e.preventDefault();
         setLocked(true);
         setRulerY((prev) =>
           Math.max(
             effectiveHeight / 2,
-            Math.min(maxH - effectiveHeight / 2, prev + step),
+            Math.min(Math.max(effectiveHeight / 2, maxH - effectiveHeight / 2), prev + step),
           ),
         );
       } else if (e.key === 'ArrowUp' || e.key === 'k') {
@@ -95,7 +121,7 @@ export function ReadingRuler({
         setRulerY((prev) =>
           Math.max(
             effectiveHeight / 2,
-            Math.min(maxH - effectiveHeight / 2, prev - step),
+            Math.min(Math.max(effectiveHeight / 2, maxH - effectiveHeight / 2), prev - step),
           ),
         );
       }
@@ -109,15 +135,11 @@ export function ReadingRuler({
   }
 
   const updateFromClientY = (clientY: number) => {
-    const el = containerRef.current;
+    const el = surfaceRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const localY = clientY - rect.top;
-    const clamped = Math.max(
-      effectiveHeight / 2,
-      Math.min(rect.height - effectiveHeight / 2, localY),
-    );
-    setRulerY(clamped);
+    setRulerY(clampRulerY(localY, rect.height));
   };
 
   const palette = RULER_COLOR_STYLES[color];
@@ -128,21 +150,7 @@ export function ReadingRuler({
   const topMaskHeight = Math.max(0, rulerY - effectiveHeight / 2);
 
   return (
-    <div
-      ref={containerRef}
-      className="relative select-text"
-      onPointerMove={(e) => {
-        if (!locked && e.pointerType === 'mouse') {
-          updateFromClientY(e.clientY);
-        }
-      }}
-      onPointerDown={(e) => {
-        // Touch & click repositioning support
-        if (e.pointerType !== 'mouse') {
-          updateFromClientY(e.clientY);
-        }
-      }}
-    >
+    <div className="relative select-text">
       {/* Floating quick bar for keyboard/touch users */}
       <div
         className={`sticky top-16 z-20 mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2 text-xs font-semibold shadow-sm ${
@@ -223,7 +231,21 @@ export function ReadingRuler({
         </div>
       </div>
 
-      <div className="relative overflow-hidden rounded-2xl">
+      <div
+        ref={surfaceRef}
+        className="relative overflow-hidden rounded-2xl"
+        onPointerMove={(e) => {
+          if (!locked && e.pointerType === 'mouse') {
+            updateFromClientY(e.clientY);
+          }
+        }}
+        onPointerDown={(e) => {
+          // Touch & click repositioning support on reading surface only
+          if (e.pointerType !== 'mouse') {
+            updateFromClientY(e.clientY);
+          }
+        }}
+      >
         {children}
 
         {/* Overlay mask + spotlight band (pointer-events-none so text stays selectable & clickable) */}

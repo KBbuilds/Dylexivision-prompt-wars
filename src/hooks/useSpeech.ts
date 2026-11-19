@@ -172,6 +172,7 @@ export function useSpeech(): SpeechController {
   const utteranceBaseOffsetRef = useRef<number>(0);
   const lastCharOffsetRef = useRef<number>(0);
   const wordBoundarySeenRef = useRef<boolean>(false);
+  const dirtyUtteranceRef = useRef<boolean>(false);
 
   // Prevent Chromium/Safari garbage collection from dropping utterance mid-sentence
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -239,6 +240,7 @@ export function useSpeech(): SpeechController {
     utteranceBaseOffsetRef.current = 0;
     lastCharOffsetRef.current = 0;
     wordBoundarySeenRef.current = false;
+    dirtyUtteranceRef.current = false;
     setSpeaking(false);
     setPaused(false);
     setCurrentSentenceIndex(null);
@@ -299,6 +301,7 @@ export function useSpeech(): SpeechController {
       utteranceBaseOffsetRef.current = safeOffset;
       lastCharOffsetRef.current = safeOffset;
       wordBoundarySeenRef.current = false;
+      dirtyUtteranceRef.current = false;
       setCurrentSentenceIndex(idx);
       setCurrentWordCharIndex(
         wordSyncStatusRef.current === 'supported' ? safeOffset : null,
@@ -550,6 +553,15 @@ export function useSpeech(): SpeechController {
 
   const resume = useCallback(() => {
     if (!supported || !speakingRef.current) return;
+    if (dirtyUtteranceRef.current) {
+      dirtyUtteranceRef.current = false;
+      sessionRef.current += 1;
+      const sid = sessionRef.current;
+      window.speechSynthesis.cancel();
+      setPaused(false);
+      speakIndex(indexRef.current, sid, 45, lastCharOffsetRef.current);
+      return;
+    }
     window.speechSynthesis.resume();
     setPaused(false);
     // Recover cleanly if the browser dropped the paused utterance queue
@@ -605,11 +617,15 @@ export function useSpeech(): SpeechController {
       } catch {
         // ignore
       }
-      if (supported && speakingRef.current && !pausedRef.current) {
-        sessionRef.current += 1;
-        const sid = sessionRef.current;
-        window.speechSynthesis.cancel();
-        speakIndex(indexRef.current, sid, 45, lastCharOffsetRef.current);
+      if (supported && speakingRef.current) {
+        if (pausedRef.current) {
+          dirtyUtteranceRef.current = true;
+        } else {
+          sessionRef.current += 1;
+          const sid = sessionRef.current;
+          window.speechSynthesis.cancel();
+          speakIndex(indexRef.current, sid, 45, lastCharOffsetRef.current);
+        }
       }
     },
     [supported, speakIndex],
@@ -628,11 +644,15 @@ export function useSpeech(): SpeechController {
       } catch {
         // ignore
       }
-      if (supported && speakingRef.current && !pausedRef.current) {
-        sessionRef.current += 1;
-        const sid = sessionRef.current;
-        window.speechSynthesis.cancel();
-        speakIndex(indexRef.current, sid, 45, lastCharOffsetRef.current);
+      if (supported && speakingRef.current) {
+        if (pausedRef.current) {
+          dirtyUtteranceRef.current = true;
+        } else {
+          sessionRef.current += 1;
+          const sid = sessionRef.current;
+          window.speechSynthesis.cancel();
+          speakIndex(indexRef.current, sid, 45, lastCharOffsetRef.current);
+        }
       }
     },
     [supported, speakIndex],

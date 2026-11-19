@@ -5,13 +5,16 @@ import {
   useMemo,
   useRef,
   useState,
+  type MouseEvent,
   type ReactNode,
 } from 'react';
 import {
   BookOpenText,
   BookmarkCheck,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Eye,
   Home,
   Info,
@@ -84,6 +87,15 @@ interface ReaderPageProps {
 }
 
 type SidebarTab = 'typography' | 'themes' | 'aids' | 'tools' | 'speech';
+
+function resolveFontFamilyStack(fontFamily: string): string {
+  const fallback =
+    '"Atkinson Hyperlegible", "Noto Sans Tamil", "Noto Sans Devanagari", "Noto Sans Telugu", "Noto Sans Malayalam", "Noto Sans Kannada", Georgia, serif';
+  if (fontFamily === 'OpenDyslexic') {
+    return `"OpenDyslexic", "OpenDyslexicRegular", ${fallback}`;
+  }
+  return `"${fontFamily}", ${fallback}`;
+}
 
 function getPunctuationStyle(kind: PunctuationKind | undefined, dark: boolean): string {
   switch (kind) {
@@ -386,7 +398,7 @@ function RenderSentenceText({
   isSpokenSentence: boolean;
   activeWordIndex: number | null;
   dark: boolean;
-  onWordClick?: (charStart: number) => void;
+  onWordClick?: (charStart: number, event: MouseEvent<HTMLSpanElement>) => void;
   activeWordRef?: (el: HTMLSpanElement | null) => void;
 }) {
   const anyAidActive =
@@ -460,7 +472,7 @@ function RenderSentenceText({
             onClick={(e) => {
               if (window.getSelection()?.toString()) return;
               e.stopPropagation();
-              onWordClick?.(token.charStart);
+              onWordClick?.(token.charStart, e);
             }}
             title="Click word to start Karaoke Reading from here"
             className={`cursor-pointer rounded transition-colors ${
@@ -528,8 +540,12 @@ export function ReaderPage({
   const [sandhiLoading, setSandhiLoading] = useState(false);
   const [sandhiError, setSandhiError] = useState<string | null>(null);
 
+  const [copiedPassage, setCopiedPassage] = useState(false);
+
   const sentenceRefs = useRef<Record<number, HTMLSpanElement | null>>({});
   const activeWordElRef = useRef<HTMLSpanElement | null>(null);
+  const pointerHadSelectionRef = useRef(false);
+  const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const setActiveWordElRef = useCallback((el: HTMLSpanElement | null) => {
     activeWordElRef.current = el;
   }, []);
@@ -639,6 +655,9 @@ export function ReaderPage({
 
   const handleModeChange = useCallback(
     (mode: ReadingMode) => {
+      if (mode !== settings.readingMode && speech.speaking) {
+        speech.stop();
+      }
       if (mode === 'line-focus') {
         onSettingsChange({ readingMode: mode, rulerEnabled: true });
       } else {
@@ -648,7 +667,7 @@ export function ReaderPage({
         setShowFocusSidebar(false);
       }
     },
-    [onSettingsChange],
+    [settings.readingMode, speech, onSettingsChange],
   );
 
   // Studio keyboard shortcuts
@@ -746,15 +765,27 @@ export function ReaderPage({
 
   // Never automatically speak when clicking, touching, selecting, scrolling, or copying text
   const handleSentenceClick = (sentenceIdx: number) => {
-    if (window.getSelection()?.toString()) return;
+    if (window.getSelection()?.toString() || pointerHadSelectionRef.current) {
+      pointerHadSelectionRef.current = false;
+      return;
+    }
     if (isSentenceFocusMode) {
       setSelectedSentenceIndex(sentenceIdx);
     }
   };
 
   const handleWordClick = useCallback(
-    (sentenceIdx: number, charStart: number) => {
+    (sentenceIdx: number, charStart: number, event?: MouseEvent<HTMLSpanElement>) => {
       if (window.getSelection()?.toString()) return;
+      if (pointerHadSelectionRef.current) {
+        pointerHadSelectionRef.current = false;
+        return;
+      }
+      if (event && pointerStartRef.current) {
+        const dx = Math.abs(event.clientX - pointerStartRef.current.x);
+        const dy = Math.abs(event.clientY - pointerStartRef.current.y);
+        if (dx > 6 || dy > 6) return;
+      }
       setSelectedSentenceIndex(sentenceIdx);
       if (speech.supported) {
         speech.playFromWord(sentenceTexts, sentenceIdx, charStart);
@@ -762,6 +793,32 @@ export function ReaderPage({
     },
     [speech, sentenceTexts],
   );
+
+  const handleCopyPassage = async () => {
+    if (!text.trim()) return;
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
+      setCopiedPassage(true);
+      window.setTimeout(() => setCopiedPassage(false), 2000);
+    }
+  };
 
   const runEnglishMorphology = async (wordToAnalyze: string, useAi: boolean) => {
     const clean = wordToAnalyze.trim();
@@ -950,8 +1007,8 @@ export function ReaderPage({
                         isSpokenSentence={isSpoken}
                         activeWordIndex={isSpoken ? activeSpokenWordIndex : null}
                         dark={dark}
-                        onWordClick={(charStart) =>
-                          handleWordClick(sent.index, charStart)
+                        onWordClick={(charStart, ev) =>
+                          handleWordClick(sent.index, charStart, ev)
                         }
                         activeWordRef={setActiveWordElRef}
                       />{' '}
@@ -1024,8 +1081,8 @@ export function ReaderPage({
                     isSpokenSentence={isSpoken}
                     activeWordIndex={isSpoken ? activeSpokenWordIndex : null}
                     dark={dark}
-                    onWordClick={(charStart) =>
-                      handleWordClick(sent.index, charStart)
+                    onWordClick={(charStart, ev) =>
+                      handleWordClick(sent.index, charStart, ev)
                     }
                     activeWordRef={setActiveWordElRef}
                   />{' '}
@@ -1241,6 +1298,20 @@ export function ReaderPage({
               >
                 <Ruler className="h-3.5 w-3.5" aria-hidden />
                 Ruler
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleCopyPassage()}
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 min-h-[36px] text-xs font-semibold whitespace-nowrap ${tokens.secondaryBtn}`}
+                title="Copy full passage text"
+              >
+                {copiedPassage ? (
+                  <Check className="h-3.5 w-3.5 text-teal-600" aria-hidden />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" aria-hidden />
+                )}
+                {copiedPassage ? 'Copied' : 'Copy'}
               </button>
 
               <button
@@ -1573,6 +1644,12 @@ export function ReaderPage({
           >
             <article
               aria-label="Reading passage"
+              onPointerDown={(e) => {
+                pointerHadSelectionRef.current = Boolean(
+                  window.getSelection()?.toString(),
+                );
+                pointerStartRef.current = { x: e.clientX, y: e.clientY };
+              }}
               style={{
                 ...tokens.textStyles,
                 paddingLeft: `${Math.max(16, settings.marginX)}px`,
@@ -1582,7 +1659,7 @@ export function ReaderPage({
             >
               <div
                 style={{
-                  fontFamily: `"${settings.fontFamily}", "Atkinson Hyperlegible", "Noto Sans Tamil", "Noto Sans Devanagari", "Noto Sans Telugu", "Noto Sans Malayalam", "Noto Sans Kannada", Georgia, serif`,
+                  fontFamily: resolveFontFamilyStack(settings.fontFamily),
                   fontSize: `${settings.fontSize}px`,
                   letterSpacing: `${settings.letterSpacing}px`,
                   wordSpacing: `${settings.wordSpacing}px`,
