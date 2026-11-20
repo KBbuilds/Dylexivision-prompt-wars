@@ -398,7 +398,10 @@ export function ScanTextPage({
     const workerPath = origin
       ? `${origin}/tesseract/worker.min.js`
       : '/tesseract/worker.min.js';
-    const corePath = origin ? `${origin}/tesseract` : '/tesseract';
+    // Point at one specific core file (SIMD build) to keep the repo small.
+    const corePath = origin
+      ? `${origin}/tesseract/tesseract-core-simd-lstm.wasm.js`
+      : '/tesseract/tesseract-core-simd-lstm.wasm.js';
 
     const createPromise = (async () => {
       const { createWorker, OEM, PSM } = await import('tesseract.js');
